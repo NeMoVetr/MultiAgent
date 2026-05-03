@@ -2,22 +2,23 @@ import json
 import logging
 import math
 import os
-import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from StatusAgent import AgentStatus
+from .algorithm_contract import (
+    AlgorithmConfig,
+    AlgorithmInputRecord,
+    AlgorithmMode,
+    AlgorithmResult,
+    BaseAlgorithm,
+    OutputStorageStrategy,
+)
+
 logger = logging.getLogger(__name__)
-
-
-def utc_now_iso() -> str:
-    return (
-        datetime.now(timezone.utc)
-        .isoformat(timespec="milliseconds")
-        .replace("+00:00", "Z")
-    )
 
 
 def env_float(name: str, default: float) -> float:
@@ -72,12 +73,18 @@ def get_first_float(source: dict[str, Any], keys: list[str]) -> float | None:
     return None
 
 
-@dataclass(frozen=True)
-class SensorRecord:
-    gateway_guid: str
-    timestamp: str
-    value: Any
-    received_monotonic: float
+def parse_utc_timestamp(timestamp: str) -> datetime:
+    value = str(timestamp).strip()
+
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+
+    dt = datetime.fromisoformat(value)
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+
+    return dt.astimezone(timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -95,28 +102,24 @@ class RainInput:
 
 
 @dataclass(frozen=True)
-class IrrigationDecision:
-    timestamp: str
-    value: bool
-
-
-@dataclass(frozen=True)
-class IrrigationAlgorithmConfig:
+class IrrigationSettings:
     weather_gateway_guid: str
     solar_gateway_guid: str
     light_gateway_guid: str
     rain_gateway_guid: str
 
-    crop_coefficient: float = 1.0
-    management_allowed_depletion_mm: float = 25.0
-    max_depletion_mm: float = 80.0
-    max_wind_speed_ms: float = 8.0
-    default_step_seconds: float = 300.0
-    rain_value_mode: str = "incremental"
-    memory_file: str = "./data/irrigation_memory.json"
+    crop_coefficient: float
+    management_allowed_depletion_mm: float
+    max_depletion_mm: float
+    max_wind_speed_ms: float
+    default_step_seconds: float
+    rain_value_mode: str
+    memory_file: str
+    output_file: str
+    max_data_age_seconds: float
 
     @classmethod
-    def from_env(cls) -> "IrrigationAlgorithmConfig":
+    def from_env(cls) -> "IrrigationSettings":
         return cls(
             weather_gateway_guid=env_str(
                 "GATEWAY_WEATHER_GUID",
@@ -144,120 +147,115 @@ class IrrigationAlgorithmConfig:
                 "IRRIGATION_MEMORY_FILE",
                 "./data/irrigation_memory.json",
             ),
+            output_file=env_str(
+                "IRRIGATION_DECISION_FILE",
+                "./data/irrigation_decision.json",
+            ),
+            max_data_age_seconds=env_float("ALGORITHM_MAX_DATA_AGE_SECONDS", 120.0),
         )
 
 
-class IrrigationAlgorithm:
-    """
-    Внешний алгоритм автополива.
+class IrrigationAlgorithm(BaseAlgorithm):
+    def __init__(self, settings: IrrigationSettings | None = None):
+        self.settings = settings or IrrigationSettings.from_env()
 
-    Агент передаёт сюда только нормализованные данные.
-    Внутри алгоритм:
-    1. Берёт данные метеостанции, солнечной радиации, освещённости и дождя.
-    2. Рассчитывает приближённую ETo по Penman-Monteith.
-    3. Обновляет расчётный дефицит воды в почве.
-    4. Возвращает true/false: нужен полив или нет.
-    """
+        self.config = AlgorithmConfig(
+            name="irrigation",
+            mode=AlgorithmMode.COMPLETE_BATCH,
+            input_ontology="algorithm-input",
+            output_ontology=None,
+            output_jid=None,
+            required_gateway_guids=(
+                self.settings.weather_gateway_guid,
+                self.settings.solar_gateway_guid,
+                self.settings.light_gateway_guid,
+                self.settings.rain_gateway_guid,
+            ),
+            require_all_updated=True,
+            require_same_timestamp=True,
+            max_data_age_seconds=self.settings.max_data_age_seconds,
+            output_file=self.settings.output_file,
+            output_storage_strategy=OutputStorageStrategy.LATEST,
+        )
 
-    def __init__(self, config: IrrigationAlgorithmConfig | None = None):
-        self.config = config or IrrigationAlgorithmConfig.from_env()
-        self.memory_file = Path(self.config.memory_file)
+        self.memory_file = Path(self.settings.memory_file)
         self.memory_file.parent.mkdir(parents=True, exist_ok=True)
 
-        self._last_run_monotonic: float | None = None
+    @classmethod
+    def from_env(cls) -> "IrrigationAlgorithm":
+        return cls(settings=IrrigationSettings.from_env())
 
-    @property
-    def required_gateway_guids(self) -> tuple[str, str, str, str]:
-        return (
-            self.config.weather_gateway_guid,
-            self.config.solar_gateway_guid,
-            self.config.light_gateway_guid,
-            self.config.rain_gateway_guid,
-        )
-
-    def missing_gateways(
+    async def run(
         self,
-        records: Mapping[str, SensorRecord],
-    ) -> list[str]:
-        return [
-            gateway_guid
-            for gateway_guid in self.required_gateway_guids
-            if gateway_guid not in records
-        ]
+        records: Mapping[str, AlgorithmInputRecord],
+        trigger_record: AlgorithmInputRecord | None = None,
+    ) -> AlgorithmResult:
+        batch_timestamp = self.get_batch_timestamp(records)
 
-    def stale_gateways(
-        self,
-        records: Mapping[str, SensorRecord],
-        max_age_seconds: float,
-    ) -> list[str]:
-        now = time.monotonic()
-
-        stale = []
-
-        for gateway_guid in self.required_gateway_guids:
-            record = records.get(gateway_guid)
-
-            if record is None:
-                stale.append(gateway_guid)
-                continue
-
-            if now - record.received_monotonic > max_age_seconds:
-                stale.append(gateway_guid)
-
-        return stale
-
-    def run_from_records(
-        self,
-        records: Mapping[str, SensorRecord],
-    ) -> IrrigationDecision:
-        missing = self.missing_gateways(records)
-
-        if missing:
-            raise ValueError(f"Missing required gateway data: {missing}")
-
-        weather = self._extract_weather(
-            records[self.config.weather_gateway_guid].value
+        weather = self.extract_weather(
+            records[self.settings.weather_gateway_guid].value
         )
-        solar_radiation_wm2 = self._extract_solar_radiation(
-            records[self.config.solar_gateway_guid].value
+        solar_radiation_wm2 = self.extract_solar_radiation(
+            records[self.settings.solar_gateway_guid].value
         )
-        illuminance_lux = self._extract_illuminance(
-            records[self.config.light_gateway_guid].value
+        illuminance_lux = self.extract_illuminance(
+            records[self.settings.light_gateway_guid].value
         )
-        rain = self._extract_rain(
-            records[self.config.rain_gateway_guid].value
+        rain = self.extract_rain(
+            records[self.settings.rain_gateway_guid].value
         )
 
-        return self.run(
+        decision = self.calculate_decision(
+            timestamp=batch_timestamp,
             weather=weather,
             solar_radiation_wm2=solar_radiation_wm2,
             illuminance_lux=illuminance_lux,
             rain=rain,
         )
 
-    def run(
+        status_message = (
+            "irrigation required"
+            if decision["value"]
+            else "irrigation not required"
+        )
+
+        return AlgorithmResult(
+            outputs=[decision],
+            status=AgentStatus.WORKING,
+            status_message=status_message,
+        )
+
+    def get_batch_timestamp(
         self,
+        records: Mapping[str, AlgorithmInputRecord],
+    ) -> str:
+        timestamps = {
+            record.timestamp
+            for record in records.values()
+            if record.timestamp is not None
+        }
+
+        if len(timestamps) != 1:
+            raise ValueError(f"Expected one timestamp in batch, got {timestamps}")
+
+        return next(iter(timestamps))
+
+    def calculate_decision(
+        self,
+        timestamp: str,
         weather: WeatherInput,
         solar_radiation_wm2: float,
         illuminance_lux: float,
         rain: RainInput,
-    ) -> IrrigationDecision:
-        memory = self._load_memory()
+    ) -> dict[str, Any]:
+        memory = self.load_memory()
 
-        now_iso = utc_now_iso()
-        now_monotonic = time.monotonic()
+        dt_hours = self.calculate_dt_hours(
+            current_timestamp=timestamp,
+            memory=memory,
+        )
 
-        if self._last_run_monotonic is None:
-            dt_hours = self.config.default_step_seconds / 3600.0
-        else:
-            dt_hours = max(
-                0.0,
-                (now_monotonic - self._last_run_monotonic) / 3600.0,
-            )
-
-        self._last_run_monotonic = now_monotonic
-
-        eto_mm_hour = self._calculate_hourly_eto(
+        eto_mm_hour = self.calculate_hourly_eto(
             temperature_c=weather.temperature_c,
             relative_humidity=weather.relative_humidity,
             pressure_kpa=weather.pressure_kpa,
@@ -266,48 +264,37 @@ class IrrigationAlgorithm:
             illuminance_lux=illuminance_lux,
         )
 
-        etc_mm = self.config.crop_coefficient * eto_mm_hour * dt_hours
-        effective_rainfall_mm = self._get_effective_rainfall(memory, rain)
+        etc_mm = self.settings.crop_coefficient * eto_mm_hour * dt_hours
+        effective_rainfall_mm = self.get_effective_rainfall(memory, rain)
 
         depletion_mm = float(memory.get("depletion_mm", 0.0))
         depletion_mm = depletion_mm + etc_mm - effective_rainfall_mm
         depletion_mm = min(
             max(depletion_mm, 0.0),
-            self.config.max_depletion_mm,
+            self.settings.max_depletion_mm,
         )
 
-        wind_too_high = weather.wind_speed_ms > self.config.max_wind_speed_ms
+        wind_too_high = weather.wind_speed_ms > self.settings.max_wind_speed_ms
 
         irrigation_required = (
-            depletion_mm >= self.config.management_allowed_depletion_mm
+            depletion_mm >= self.settings.management_allowed_depletion_mm
             and not rain.is_raining
             and not wind_too_high
         )
 
         memory.update(
             {
-                "updated_at": now_iso,
+                "updated_at": timestamp,
                 "depletion_mm": depletion_mm,
                 "last_eto_mm_hour": eto_mm_hour,
                 "last_etc_increment_mm": etc_mm,
                 "last_effective_rainfall_mm": effective_rainfall_mm,
                 "last_irrigation_required": irrigation_required,
-                "last_weather": {
-                    "temperature_c": weather.temperature_c,
-                    "relative_humidity": weather.relative_humidity,
-                    "pressure_kpa": weather.pressure_kpa,
-                    "wind_speed_ms": weather.wind_speed_ms,
-                },
-                "last_solar_radiation_wm2": solar_radiation_wm2,
-                "last_illuminance_lux": illuminance_lux,
-                "last_rain": {
-                    "rainfall_mm": rain.rainfall_mm,
-                    "is_raining": rain.is_raining,
-                },
+                "last_input_timestamp": timestamp,
             }
         )
 
-        self._write_memory(memory)
+        self.write_memory(memory)
 
         logger.info(
             "Irrigation decision=%s, depletion=%.2f mm, ETo=%.4f mm/h, ETc+=%.4f mm, rain=%.2f mm",
@@ -318,12 +305,38 @@ class IrrigationAlgorithm:
             effective_rainfall_mm,
         )
 
-        return IrrigationDecision(
-            timestamp=now_iso,
-            value=irrigation_required,
-        )
+        return {
+            "timestamp": timestamp,
+            "value": irrigation_required,
+        }
 
-    def _extract_weather(self, value: Any) -> WeatherInput:
+    def calculate_dt_hours(
+        self,
+        current_timestamp: str,
+        memory: dict[str, Any],
+    ) -> float:
+        previous_timestamp = memory.get("last_input_timestamp")
+
+        if not previous_timestamp:
+            return self.settings.default_step_seconds / 3600.0
+
+        try:
+            current_dt = parse_utc_timestamp(current_timestamp)
+            previous_dt = parse_utc_timestamp(previous_timestamp)
+            seconds = (current_dt - previous_dt).total_seconds()
+
+            if seconds <= 0:
+                return 0.0
+
+            return seconds / 3600.0
+
+        except Exception:
+            logger.warning(
+                "Cannot calculate dt from timestamps. Using default step.",
+            )
+            return self.settings.default_step_seconds / 3600.0
+
+    def extract_weather(self, value: Any) -> WeatherInput:
         if not isinstance(value, dict):
             raise ValueError("Weather gateway value must be an object")
 
@@ -363,7 +376,7 @@ class IrrigationAlgorithm:
             wind_speed_ms=wind_speed,
         )
 
-    def _extract_solar_radiation(self, value: Any) -> float:
+    def extract_solar_radiation(self, value: Any) -> float:
         if isinstance(value, dict):
             result = get_first_float(
                 value,
@@ -383,7 +396,7 @@ class IrrigationAlgorithm:
 
         return result
 
-    def _extract_illuminance(self, value: Any) -> float:
+    def extract_illuminance(self, value: Any) -> float:
         if isinstance(value, dict):
             result = get_first_float(
                 value,
@@ -397,7 +410,7 @@ class IrrigationAlgorithm:
 
         return result
 
-    def _extract_rain(self, value: Any) -> RainInput:
+    def extract_rain(self, value: Any) -> RainInput:
         rainfall_mm = 0.0
         is_raining = False
 
@@ -427,7 +440,7 @@ class IrrigationAlgorithm:
                 else value.get("rain")
             )
 
-            is_raining = self._parse_rain_flag(rain_flag)
+            is_raining = self.parse_rain_flag(rain_flag)
 
             if rainfall_mm > 0:
                 is_raining = True
@@ -444,7 +457,7 @@ class IrrigationAlgorithm:
             is_raining=is_raining,
         )
 
-    def _parse_rain_flag(self, value: Any) -> bool:
+    def parse_rain_flag(self, value: Any) -> bool:
         if isinstance(value, bool):
             return value
 
@@ -463,7 +476,7 @@ class IrrigationAlgorithm:
 
         return False
 
-    def _calculate_hourly_eto(
+    def calculate_hourly_eto(
         self,
         temperature_c: float,
         relative_humidity: float,
@@ -472,24 +485,9 @@ class IrrigationAlgorithm:
         solar_radiation_wm2: float,
         illuminance_lux: float,
     ) -> float:
-        """
-        Упрощённая почасовая FAO-56 Penman-Monteith.
-
-        Входы:
-        - temperature_c: °C
-        - relative_humidity: %
-        - pressure_kpa: kPa или hPa/Pa, нормализуется ниже
-        - wind_speed_ms: m/s
-        - solar_radiation_wm2: W/m²
-        - illuminance_lux: lux
-
-        Выход:
-        - ETo, mm/hour
-        """
-
         temperature_c = max(min(temperature_c, 60.0), -40.0)
         relative_humidity = max(min(relative_humidity, 100.0), 0.0)
-        pressure_kpa = self._normalize_pressure_kpa(pressure_kpa)
+        pressure_kpa = self.normalize_pressure_kpa(pressure_kpa)
         wind_speed_ms = max(wind_speed_ms, 0.0)
         solar_radiation_wm2 = max(solar_radiation_wm2, 0.0)
         illuminance_lux = max(illuminance_lux, 0.0)
@@ -538,14 +536,7 @@ class IrrigationAlgorithm:
 
         return max(numerator / denominator, 0.0)
 
-    def _normalize_pressure_kpa(self, pressure: float) -> float:
-        """
-        Нормализация давления:
-        - 101325  -> Pa  -> 101.325 kPa
-        - 1013    -> hPa -> 101.3 kPa
-        - 101.3   -> kPa -> 101.3 kPa
-        """
-
+    def normalize_pressure_kpa(self, pressure: float) -> float:
         if pressure > 2000:
             return pressure / 1000.0
 
@@ -554,12 +545,12 @@ class IrrigationAlgorithm:
 
         return pressure
 
-    def _get_effective_rainfall(
+    def get_effective_rainfall(
         self,
         memory: dict[str, Any],
         rain: RainInput,
     ) -> float:
-        if self.config.rain_value_mode == "cumulative":
+        if self.settings.rain_value_mode == "cumulative":
             previous = memory.get("last_rain_cumulative_mm")
             current = rain.rainfall_mm
 
@@ -572,7 +563,7 @@ class IrrigationAlgorithm:
 
         return max(0.0, rain.rainfall_mm)
 
-    def _load_memory(self) -> dict[str, Any]:
+    def load_memory(self) -> dict[str, Any]:
         if not self.memory_file.exists():
             return {}
 
@@ -590,7 +581,7 @@ class IrrigationAlgorithm:
 
         return {}
 
-    def _write_memory(self, data: dict[str, Any]) -> None:
+    def write_memory(self, data: dict[str, Any]) -> None:
         tmp_file = self.memory_file.with_name(f".{self.memory_file.name}.tmp")
 
         with tmp_file.open("w", encoding="utf-8") as file:

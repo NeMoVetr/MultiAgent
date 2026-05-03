@@ -1,3 +1,3 @@
-from .irrigation_agent import IrrigationAgent
+from .generic_algorithm_agent import GenericAlgorithmAgent
 
-__all__ = ["IrrigationAgent"]
+__all__ = ["GenericAlgorithmAgent"]

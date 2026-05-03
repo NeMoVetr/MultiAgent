@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 MONITORING_ONTOLOGY = "sensor-monitoring"
 ALGORITHM_INPUT_ONTOLOGY = "algorithm-input"
+NORMALIZATION_INPUT_ONTOLOGY = "normalization-input"
 
 
 def env_float(name: str, default: float) -> float:
@@ -143,7 +144,7 @@ class SensorMessageReceiverBehaviour(CyclicBehaviour):
         await self.send_ack(msg, sensor_id, kind, received_at)
 
         if algorithm_record is not None:
-            await self.forward_to_algorithm_agent(algorithm_record)
+            await self.forward_to_normalizer_agent(algorithm_record)
 
     async def send_ack(
         self,
@@ -176,23 +177,23 @@ class SensorMessageReceiverBehaviour(CyclicBehaviour):
 
         await self.send(ack)
 
-    async def forward_to_algorithm_agent(self, record: dict[str, Any]) -> None:
-        if not self.agent.algorithm_agent_jid:
+    async def forward_to_normalizer_agent(self, record: dict[str, Any]) -> None:
+        if not self.agent.normalizer_agent_jid:
             return
 
-        msg = Message(to=self.agent.algorithm_agent_jid)
+        msg = Message(to=self.agent.normalizer_agent_jid)
         msg.set_metadata("performative", "inform")
-        msg.set_metadata("ontology", ALGORITHM_INPUT_ONTOLOGY)
+        msg.set_metadata("ontology", NORMALIZATION_INPUT_ONTOLOGY)
         msg.body = json.dumps(record, ensure_ascii=False)
 
         try:
             await self.send(msg)
             logger.debug(
-                "Manager forwarded gateway %s data to algorithm agent",
+                "Manager forwarded gateway %s data to normalizer agent",
                 record.get("gateway_guid"),
             )
         except Exception:
-            logger.exception("Manager failed to forward data to algorithm agent")
+            logger.exception("Manager failed to forward data to normalizer agent")
 
 
 class ManagerHealthMonitorBehaviour(PeriodicBehaviour):
@@ -214,9 +215,9 @@ class SensorManagerAgent(StatusAwareAgent):
         self.expected_sensor_ids = expected_sensor_ids()
         self.started_at_monotonic = time.monotonic()
 
-        self.algorithm_agent_jid = os.getenv(
-            "ALGORITHM_AGENT_JID",
-            "irrigation@localhost",
+        self.normalizer_agent_jid = os.getenv(
+            "NORMALIZER_AGENT_JID",
+            "normalizer@localhost",
         )
 
         self.sensor_states: dict[str, dict[str, Any]] = {
