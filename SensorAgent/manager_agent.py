@@ -1,7 +1,6 @@
-# manager_agent.py
-
 import asyncio
 import json
+import logging
 import os
 import time
 from pathlib import Path
@@ -16,20 +15,18 @@ from StatusAgent import AgentStatus, StatusAwareAgent, utc_now_iso
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 MONITORING_ONTOLOGY = "sensor-monitoring"
+ALGORITHM_INPUT_ONTOLOGY = "algorithm-input"
 
 
 def env_float(name: str, default: float) -> float:
     try:
         return float(os.getenv(name, str(default)))
     except ValueError:
+        logger.warning("Invalid value for %s. Using default: %s", name, default)
         return default
-
-
-def make_internal_template(name: str) -> Template:
-    template = Template()
-    template.set_metadata("__internal_behaviour__", name)
-    return template
 
 
 def make_sensor_message_template() -> Template:
@@ -48,9 +45,16 @@ def expected_sensor_ids() -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def compact_sensor_list(items: list[str]) -> str:
+    if not items:
+        return "none"
+
+    return ",".join(items)
+
+
 class SensorMessageReceiverBehaviour(CyclicBehaviour):
     async def on_start(self) -> None:
-        print("[MANAGER] Sensor message receiver started")
+        logger.info("Manager message receiver started")
 
     async def run(self) -> None:
         msg = await self.receive(timeout=5)
@@ -66,11 +70,13 @@ class SensorMessageReceiverBehaviour(CyclicBehaviour):
         try:
             body = json.loads(msg.body)
         except json.JSONDecodeError:
-            print(f"[MANAGER] Invalid JSON from {sender_jid}: {msg.body}")
+            logger.warning("Manager received invalid JSON from %s", sender_bare_jid)
             return
 
         sensor_id = body.get("sensor_id") or sender_bare_jid.split("@")[0]
         kind = msg.get_metadata("kind") or body.get("kind") or "unknown"
+
+        algorithm_record = None
 
         async with self.agent.state_lock:
             sensor_state = self.agent.sensor_states.setdefault(
@@ -95,7 +101,7 @@ class SensorMessageReceiverBehaviour(CyclicBehaviour):
                         "sensor_status",
                         AgentStatus.ONLINE_IDLE.value,
                     ),
-                    "reported_status_detail": body.get("sensor_status_detail", ""),
+                    "reported_message": body.get("sensor_status_message", ""),
                     "last_heartbeat_at": (
                         received_at
                         if kind == "heartbeat"
@@ -116,16 +122,28 @@ class SensorMessageReceiverBehaviour(CyclicBehaviour):
                     }
                 )
 
+                algorithm_record = self.agent.build_algorithm_record(sensor_state)
+
+                logger.debug("Manager received data from sensor %s", sensor_id)
+
+            elif kind == "heartbeat":
+                logger.debug("Manager received heartbeat from sensor %s", sensor_id)
+
+            else:
+                logger.debug(
+                    "Manager received %s message from sensor %s",
+                    kind,
+                    sensor_id,
+                )
+
             health = self.agent.compute_health_unlocked()
             self.agent.apply_health_unlocked(health)
             self.agent.write_state_file_unlocked(health)
 
         await self.send_ack(msg, sensor_id, kind, received_at)
 
-        print(
-            f"[MANAGER] Received {kind} from {sensor_id}; "
-            f"manager_status={self.agent.current_manager_status}"
-        )
+        if algorithm_record is not None:
+            await self.forward_to_algorithm_agent(algorithm_record)
 
     async def send_ack(
         self,
@@ -158,10 +176,28 @@ class SensorMessageReceiverBehaviour(CyclicBehaviour):
 
         await self.send(ack)
 
+    async def forward_to_algorithm_agent(self, record: dict[str, Any]) -> None:
+        if not self.agent.algorithm_agent_jid:
+            return
+
+        msg = Message(to=self.agent.algorithm_agent_jid)
+        msg.set_metadata("performative", "inform")
+        msg.set_metadata("ontology", ALGORITHM_INPUT_ONTOLOGY)
+        msg.body = json.dumps(record, ensure_ascii=False)
+
+        try:
+            await self.send(msg)
+            logger.debug(
+                "Manager forwarded gateway %s data to algorithm agent",
+                record.get("gateway_guid"),
+            )
+        except Exception:
+            logger.exception("Manager failed to forward data to algorithm agent")
+
 
 class ManagerHealthMonitorBehaviour(PeriodicBehaviour):
     async def on_start(self) -> None:
-        print("[MANAGER] Health monitor started")
+        logger.info("Manager health monitor started")
 
     async def run(self) -> None:
         async with self.agent.state_lock:
@@ -172,11 +208,16 @@ class ManagerHealthMonitorBehaviour(PeriodicBehaviour):
 
 class SensorManagerAgent(StatusAwareAgent):
     async def setup(self) -> None:
-        print(f"[MANAGER] Agent started: {self.jid}")
+        logger.info("Manager agent started: %s", self.jid)
 
         self.state_lock = asyncio.Lock()
         self.expected_sensor_ids = expected_sensor_ids()
         self.started_at_monotonic = time.monotonic()
+
+        self.algorithm_agent_jid = os.getenv(
+            "ALGORITHM_AGENT_JID",
+            "irrigation@localhost",
+        )
 
         self.sensor_states: dict[str, dict[str, Any]] = {
             sensor_id: {
@@ -190,9 +231,7 @@ class SensorManagerAgent(StatusAwareAgent):
         }
 
         self.current_manager_status = AgentStatus.ONLINE_IDLE.value
-        self.current_manager_detail = (
-            f"role=manager | waiting_for_sensors | expected={len(self.expected_sensor_ids)}"
-        )
+        self.current_manager_message = "waiting for sensors"
 
         self.storage_file = Path(
             os.getenv("SENSOR_STATE_FILE", "./data/sensors_state.json")
@@ -201,13 +240,10 @@ class SensorManagerAgent(StatusAwareAgent):
 
         self.set_agent_status(
             AgentStatus.ONLINE_IDLE,
-            self.current_manager_detail,
+            self.current_manager_message,
             priority=10,
         )
-
-        self.set_offline_detail(
-            f"role=manager | last_status={AgentStatus.ONLINE_IDLE.value} | stopped_at={utc_now_iso()}"
-        )
+        self.set_offline_message("stopped normally")
 
         self.add_behaviour(
             SensorMessageReceiverBehaviour(),
@@ -215,14 +251,11 @@ class SensorManagerAgent(StatusAwareAgent):
         )
 
         period = env_float("MANAGER_HEALTH_CHECK_SECONDS", 5.0)
-
-        self.add_behaviour(
-            ManagerHealthMonitorBehaviour(period=period),
-            make_internal_template("manager-health-monitor"),
-        )
+        self.add_behaviour(ManagerHealthMonitorBehaviour(period=period))
 
     def compute_health_unlocked(self) -> dict[str, Any]:
         now = time.monotonic()
+
         offline_after = env_float("MANAGER_SENSOR_OFFLINE_AFTER_SECONDS", 30.0)
         idle_after = env_float("SENSOR_IDLE_AFTER_SECONDS", 30.0)
         startup_grace = env_float("MANAGER_STARTUP_GRACE_SECONDS", 15.0)
@@ -235,6 +268,7 @@ class SensorManagerAgent(StatusAwareAgent):
 
         for sensor_id in self.expected_sensor_ids:
             sensor_state = self.sensor_states.get(sensor_id, {})
+
             last_seen_monotonic = sensor_state.get("_last_seen_monotonic")
             last_data_monotonic = sensor_state.get("_last_data_monotonic")
             reported_status = sensor_state.get(
@@ -270,30 +304,31 @@ class SensorManagerAgent(StatusAwareAgent):
 
         if len(working) == expected_count:
             manager_status = AgentStatus.WORKING
-            detail = (
-                f"role=manager | sensors_working={len(working)}/{expected_count} "
-                f"| idle=none | degraded=none | offline=none"
-            )
+            manager_message = f"all sensors active ({expected_count}/{expected_count})"
 
         elif seen_count == 0 and uptime < startup_grace:
             manager_status = AgentStatus.ONLINE_IDLE
-            detail = (
-                f"role=manager | waiting_for_sensors | seen=0/{expected_count} "
-                f"| grace={startup_grace}s"
-            )
+            manager_message = "waiting for sensors"
 
         else:
             manager_status = AgentStatus.DEGRADED
-            detail = (
-                f"role=manager | sensors_working={len(working)}/{expected_count} "
-                f"| idle={','.join(idle) or 'none'} "
-                f"| degraded={','.join(degraded) or 'none'} "
-                f"| offline={','.join(offline) or 'none'}"
-            )
+
+            details = [f"active {len(working)}/{expected_count}"]
+
+            if idle:
+                details.append(f"idle {compact_sensor_list(idle)}")
+
+            if degraded:
+                details.append(f"degraded {compact_sensor_list(degraded)}")
+
+            if offline:
+                details.append(f"offline {compact_sensor_list(offline)}")
+
+            manager_message = "; ".join(details)
 
         return {
             "manager_status": manager_status,
-            "manager_detail": detail,
+            "manager_message": manager_message,
             "working": working,
             "idle": idle,
             "degraded": degraded,
@@ -304,7 +339,10 @@ class SensorManagerAgent(StatusAwareAgent):
 
     def apply_health_unlocked(self, health: dict[str, Any]) -> None:
         manager_status: AgentStatus = health["manager_status"]
-        manager_detail: str = health["manager_detail"]
+        manager_message: str = health["manager_message"]
+
+        previous_status = self.current_manager_status
+        previous_message = self.current_manager_message
 
         for sensor_id, effective_status in health["effective_statuses"].items():
             self.sensor_states.setdefault(sensor_id, {})[
@@ -312,57 +350,100 @@ class SensorManagerAgent(StatusAwareAgent):
             ] = effective_status
 
         self.current_manager_status = manager_status.value
-        self.current_manager_detail = manager_detail
+        self.current_manager_message = manager_message
 
         self.set_agent_status(
             manager_status,
-            manager_detail,
+            manager_message,
             priority=10,
         )
-
-        self.set_offline_detail(
-            f"role=manager | last_status={manager_status.value} | {manager_detail}"
+        self.set_offline_message(
+            f"stopped normally; previous status {manager_status.value}"
         )
 
-    def write_state_file_unlocked(self, health: dict[str, Any]) -> None:
-        state = {
-            "updated_at": health["checked_at"],
-            "manager": {
-                "jid": str(self.jid).split("/")[0],
-                "status": health["manager_status"].value,
-                "detail": health["manager_detail"],
-                "working_sensors": health["working"],
-                "idle_sensors": health["idle"],
-                "degraded_sensors": health["degraded"],
-                "offline_sensors": health["offline"],
-            },
-            "sensors": {},
-        }
+        if previous_status != manager_status.value or previous_message != manager_message:
+            if manager_status == AgentStatus.DEGRADED:
+                logger.warning(
+                    "Manager status changed to %s: %s",
+                    manager_status.value,
+                    manager_message,
+                )
+            else:
+                logger.info(
+                    "Manager status changed to %s: %s",
+                    manager_status.value,
+                    manager_message,
+                )
 
-        for sensor_id in self.expected_sensor_ids:
-            source = self.sensor_states.get(sensor_id, {})
+    def extract_gateway_guid(self, sensor_state: dict[str, Any]) -> str | None:
+        mqtt_topic = sensor_state.get("mqtt_topic")
 
-            clean = {
-                key: value
-                for key, value in source.items()
-                if not key.startswith("_")
-            }
+        if not mqtt_topic:
+            return None
 
-            clean.setdefault("sensor_id", sensor_id)
-            clean.setdefault(
-                "effective_status",
-                health["effective_statuses"].get(
-                    sensor_id,
-                    AgentStatus.OFFLINE.value,
-                ),
+        return str(mqtt_topic).split("/")[-1]
+
+    def extract_timestamp_and_value(
+        self,
+        sensor_state: dict[str, Any],
+    ) -> tuple[str | None, Any]:
+        payload = sensor_state.get("payload")
+
+        if isinstance(payload, dict):
+            timestamp = (
+                payload.get("timestamp")
+                or sensor_state.get("last_data_at")
+                or sensor_state.get("last_seen_at")
             )
 
-            state["sensors"][sensor_id] = clean
+            if "value" in payload and len(payload) <= 2:
+                value = payload["value"]
+            else:
+                value = {
+                    key: item
+                    for key, item in payload.items()
+                    if key != "timestamp"
+                }
+
+            return timestamp, value
+
+        timestamp = (
+            sensor_state.get("last_data_at")
+            or sensor_state.get("last_seen_at")
+        )
+
+        return timestamp, payload
+
+    def build_algorithm_record(
+        self,
+        sensor_state: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        gateway_guid = self.extract_gateway_guid(sensor_state)
+        timestamp, value = self.extract_timestamp_and_value(sensor_state)
+
+        if not gateway_guid or timestamp is None or value is None:
+            return None
+
+        return {
+            "gateway_guid": gateway_guid,
+            "timestamp": timestamp,
+            "value": value,
+        }
+
+    def write_state_file_unlocked(self, health: dict[str, Any]) -> None:
+        records = []
+
+        for sensor_id in self.expected_sensor_ids:
+            sensor_state = self.sensor_states.get(sensor_id, {})
+            record = self.build_algorithm_record(sensor_state)
+
+            if record is not None:
+                records.append(record)
 
         tmp_file = self.storage_file.with_name(f".{self.storage_file.name}.tmp")
 
         with tmp_file.open("w", encoding="utf-8") as file:
-            json.dump(state, file, ensure_ascii=False, indent=2)
+            json.dump(records, file, ensure_ascii=False, indent=2)
             file.write("\n")
             file.flush()
             os.fsync(file.fileno())

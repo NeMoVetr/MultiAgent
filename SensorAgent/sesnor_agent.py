@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import time
 import uuid
@@ -15,6 +16,8 @@ from StatusAgent import AgentStatus, StatusAwareAgent, utc_now_iso
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 MONITORING_ONTOLOGY = "sensor-monitoring"
 
 
@@ -22,13 +25,8 @@ def env_float(name: str, default: float) -> float:
     try:
         return float(os.getenv(name, str(default)))
     except ValueError:
+        logger.warning("Invalid value for %s. Using default: %s", name, default)
         return default
-
-
-def make_internal_template(name: str) -> Template:
-    template = Template()
-    template.set_metadata("__internal_behaviour__", name)
-    return template
 
 
 def make_ack_template() -> Template:
@@ -67,32 +65,26 @@ class SensorAgentBase(StatusAwareAgent):
         self.manager_available: bool | None = None
 
         self.current_operational_status = AgentStatus.ONLINE_IDLE.value
-        self.current_status_detail = (
-            f"role=sensor | sensor={sensor_id} | mqtt=starting | manager=unknown"
-        )
+        self.current_status_message = f"{self.sensor_name} starting"
 
         self.set_agent_status(
             AgentStatus.ONLINE_IDLE,
-            self.current_status_detail,
+            self.current_status_message,
             priority=5,
         )
-
-        self.set_offline_detail(
-            f"role=sensor | sensor={sensor_id} | last_data=none | stopped_at={utc_now_iso()}"
-        )
+        self.set_offline_message("stopped normally")
 
         self.add_behaviour(ManagerAckReceiverBehaviour(), make_ack_template())
-
-        self.add_behaviour(
-            MQTTListenerBehaviour(),
-            make_internal_template(f"{sensor_id}-mqtt-listener"),
-        )
+        self.add_behaviour(MQTTListenerBehaviour())
 
         heartbeat_period = env_float("SENSOR_HEARTBEAT_SECONDS", 10.0)
+        self.add_behaviour(SensorHealthHeartbeatBehaviour(period=heartbeat_period))
 
-        self.add_behaviour(
-            SensorHealthHeartbeatBehaviour(period=heartbeat_period),
-            make_internal_template(f"{sensor_id}-heartbeat"),
+        logger.info(
+            "Sensor agent configured: %s, topic=%s, manager=%s",
+            self.sensor_id,
+            self.mqtt_topic,
+            self.manager_jid,
         )
 
     def register_pending_ack(self, conversation_id: str) -> asyncio.Future:
@@ -141,16 +133,7 @@ class SensorAgentBase(StatusAwareAgent):
 
         await self.refresh_presence_status()
 
-    def _manager_label_unlocked(self) -> str:
-        if self.manager_available is True:
-            return "ok"
-
-        if self.manager_available is False:
-            return "unavailable"
-
-        return "unknown"
-
-    def _mqtt_age_unlocked(self) -> int | None:
+    def _mqtt_data_age_unlocked(self) -> int | None:
         if self.last_mqtt_data_monotonic is None:
             return None
 
@@ -160,62 +143,56 @@ class SensorAgentBase(StatusAwareAgent):
         idle_after = env_float("SENSOR_IDLE_AFTER_SECONDS", 30.0)
 
         async with self.status_lock:
-            manager_label = self._manager_label_unlocked()
-            mqtt_age = self._mqtt_age_unlocked()
+            previous_status = self.current_operational_status
+            previous_message = self.current_status_message
+
+            mqtt_age = self._mqtt_data_age_unlocked()
 
             if self.mqtt_error:
                 status = AgentStatus.DEGRADED
-                detail = (
-                    f"role=sensor | sensor={self.sensor_id} | mqtt=error "
-                    f"| manager={manager_label} | error={self.mqtt_error[:60]}"
-                )
+                message = f"{self.sensor_name} MQTT error"
 
             elif self.manager_available is False:
                 status = AgentStatus.DEGRADED
-                detail = (
-                    f"role=sensor | sensor={self.sensor_id} | mqtt=subscribed "
-                    f"| manager=unavailable | last_data={self.last_mqtt_data_at or 'none'}"
-                )
+                message = f"{self.sensor_name} manager unavailable"
 
             elif not self.mqtt_subscribed:
                 status = AgentStatus.ONLINE_IDLE
-                detail = (
-                    f"role=sensor | sensor={self.sensor_id} | mqtt=connecting "
-                    f"| manager={manager_label} | last_data={self.last_mqtt_data_at or 'none'}"
-                )
+                message = f"{self.sensor_name} connecting to MQTT"
 
             elif self.last_mqtt_data_at is None:
                 status = AgentStatus.ONLINE_IDLE
-                detail = (
-                    f"role=sensor | sensor={self.sensor_id} | mqtt=subscribed "
-                    f"| manager={manager_label} | waiting_for_first_data"
-                )
+                message = f"{self.sensor_name} waiting for MQTT data"
 
             elif mqtt_age is not None and mqtt_age > idle_after:
                 status = AgentStatus.ONLINE_IDLE
-                detail = (
-                    f"role=sensor | sensor={self.sensor_id} | mqtt=no_recent_data "
-                    f"| no_data_for={mqtt_age}s | manager={manager_label} "
-                    f"| last_data={self.last_mqtt_data_at}"
-                )
+                message = f"{self.sensor_name} no MQTT data for {mqtt_age}s"
 
             else:
                 status = AgentStatus.WORKING
-                detail = (
-                    f"role=sensor | sensor={self.sensor_id} | mqtt=active "
-                    f"| manager={manager_label} | last_data={self.last_mqtt_data_at}"
-                )
+                message = f"{self.sensor_name} receiving MQTT data"
 
             self.current_operational_status = status.value
-            self.current_status_detail = detail
+            self.current_status_message = message
+            self.set_offline_message(f"stopped normally; previous status {status.value}")
 
-            self.set_offline_detail(
-                f"role=sensor | sensor={self.sensor_id} "
-                f"| last_status={status.value} | last_data={self.last_mqtt_data_at or 'none'} "
-                f"| manager={manager_label}"
-            )
+        self.set_agent_status(status, message, priority=5)
 
-        self.set_agent_status(status, detail, priority=5)
+        if previous_status != status.value or previous_message != message:
+            if status == AgentStatus.DEGRADED:
+                logger.warning(
+                    "Sensor %s status changed to %s: %s",
+                    self.sensor_id,
+                    status.value,
+                    message,
+                )
+            else:
+                logger.info(
+                    "Sensor %s status changed to %s: %s",
+                    self.sensor_id,
+                    status.value,
+                    message,
+                )
 
 
 class ManagerMessageMixin:
@@ -236,7 +213,7 @@ class ManagerMessageMixin:
             "sensor_name": self.agent.sensor_name,
             "topic": self.agent.mqtt_topic,
             "sensor_status": self.agent.current_operational_status,
-            "sensor_status_detail": self.agent.current_status_detail,
+            "sensor_status_message": self.agent.current_status_message,
             "sent_at": utc_now_iso(),
             **extra_body,
         }
@@ -250,10 +227,17 @@ class ManagerMessageMixin:
 
         try:
             await self.send(msg)
-        except Exception as e:
+
+        except Exception:
             self.agent.remove_pending_ack(conversation_id)
             await self.agent.set_manager_available(False)
-            print(f"[{self.agent.sensor_name}] XMPP send error: {e}")
+
+            logger.exception(
+                "Sensor %s failed to send %s message to manager",
+                self.agent.sensor_id,
+                kind,
+            )
+
             return False
 
         try:
@@ -265,9 +249,11 @@ class ManagerMessageMixin:
             self.agent.remove_pending_ack(conversation_id)
             await self.agent.set_manager_available(False)
 
-            print(
-                f"[{self.agent.sensor_name}] Manager ACK timeout "
-                f"for kind={kind}; manager={self.agent.manager_jid}"
+            logger.warning(
+                "Sensor %s did not receive manager ACK for %s within %.1fs",
+                self.agent.sensor_id,
+                kind,
+                timeout,
             )
 
             return False
@@ -287,7 +273,8 @@ class ManagerAckReceiverBehaviour(CyclicBehaviour):
                 body = json.loads(msg.body)
                 conversation_id = body.get("conversation_id")
             except json.JSONDecodeError:
-                conversation_id = None
+                logger.warning("Received invalid ACK body from manager")
+                return
 
         if conversation_id:
             self.agent.resolve_pending_ack(conversation_id, msg)
@@ -295,9 +282,9 @@ class ManagerAckReceiverBehaviour(CyclicBehaviour):
 
 class SensorHealthHeartbeatBehaviour(ManagerMessageMixin, PeriodicBehaviour):
     async def on_start(self) -> None:
-        print(
-            f"[{self.agent.sensor_name}] Heartbeat started; "
-            f"manager={self.agent.manager_jid}"
+        logger.info(
+            "Sensor %s heartbeat started",
+            self.agent.sensor_id,
         )
 
     async def run(self) -> None:
@@ -316,9 +303,10 @@ class SensorHealthHeartbeatBehaviour(ManagerMessageMixin, PeriodicBehaviour):
 
 class MQTTListenerBehaviour(ManagerMessageMixin, CyclicBehaviour):
     async def on_start(self) -> None:
-        print(f"[{self.agent.sensor_name}] Behaviour started")
-        print(f"[{self.agent.sensor_name}] MQTT topic: {self.agent.mqtt_topic}")
-        print(f"[{self.agent.sensor_name}] Manager JID: {self.agent.manager_jid}")
+        logger.info(
+            "Sensor %s MQTT listener started",
+            self.agent.sensor_id,
+        )
 
     async def run(self) -> None:
         mqtt_host = os.getenv("MQTT_HOST", "localhost")
@@ -329,9 +317,10 @@ class MQTTListenerBehaviour(ManagerMessageMixin, CyclicBehaviour):
                 await client.subscribe(self.agent.mqtt_topic)
                 await self.agent.set_mqtt_subscribed(True)
 
-                print(
-                    f"[{self.agent.sensor_name}] Successfully subscribed to MQTT topic: "
-                    f"{self.agent.mqtt_topic}"
+                logger.info(
+                    "Sensor %s subscribed to MQTT topic %s",
+                    self.agent.sensor_id,
+                    self.agent.mqtt_topic,
                 )
 
                 async for message in client.messages:
@@ -341,12 +330,19 @@ class MQTTListenerBehaviour(ManagerMessageMixin, CyclicBehaviour):
                         payload = json.loads(raw_payload)
                     except json.JSONDecodeError:
                         payload = {"raw": raw_payload}
+                        logger.warning(
+                            "Sensor %s received non-JSON MQTT payload",
+                            self.agent.sensor_id,
+                        )
 
                     await self.agent.record_mqtt_data(payload)
 
-                    print(f"\n🟢 [{self.agent.sensor_name}] MQTT message received")
-                    print(f"   Topic: {message.topic}")
-                    print(f"   Data : {json.dumps(payload, indent=2, ensure_ascii=False)}")
+                    logger.debug(
+                        "Sensor %s received MQTT message from %s: %s",
+                        self.agent.sensor_id,
+                        message.topic,
+                        payload,
+                    )
 
                     ack_ok = await self.send_to_manager_with_ack(
                         kind="data",
@@ -358,27 +354,32 @@ class MQTTListenerBehaviour(ManagerMessageMixin, CyclicBehaviour):
                     )
 
                     if ack_ok:
-                        print("   XMPP : manager ACK received")
-                    else:
-                        print("   XMPP : manager unavailable")
-
-                    print("-" * 70)
+                        logger.debug(
+                            "Sensor %s received manager ACK for data message",
+                            self.agent.sensor_id,
+                        )
 
                     await self.agent.refresh_presence_status()
 
         except MqttError as error:
             await self.agent.set_mqtt_subscribed(False, error=str(error))
 
-            print(
-                f"[{self.agent.sensor_name}] MQTT connection lost: {error}. "
-                f"Reconnecting in 5s..."
+            logger.warning(
+                "Sensor %s MQTT connection lost: %s",
+                self.agent.sensor_id,
+                error,
             )
 
             await asyncio.sleep(5)
 
-        except Exception as e:
-            await self.agent.set_mqtt_subscribed(False, error=str(e))
-            print(f"[{self.agent.sensor_name}] Critical error: {e}")
+        except Exception as error:
+            await self.agent.set_mqtt_subscribed(False, error=str(error))
+
+            logger.exception(
+                "Sensor %s critical MQTT listener error",
+                self.agent.sensor_id,
+            )
+
             await asyncio.sleep(5)
 
 

@@ -24,29 +24,39 @@ def utc_now_iso() -> str:
 def presence_show_for_status(status: AgentStatus) -> PresenceShow:
     if status == AgentStatus.WORKING:
         return PresenceShow.CHAT
+
     if status == AgentStatus.ONLINE_IDLE:
         return PresenceShow.AWAY
+
     if status == AgentStatus.DEGRADED:
         return PresenceShow.DND
+
     return PresenceShow.NONE
 
 
 class StatusAwareAgent(Agent):
+    """
+    Базовый SPADE-агент с управляемым XMPP Presence.
+
+    WORKING      -> show=chat
+    ONLINE_IDLE  -> show=away
+    DEGRADED     -> show=dnd
+    OFFLINE      -> unavailable
+    """
+
     def set_agent_status(
         self,
         status: AgentStatus | str,
-        detail: str = "",
+        message: str,
         priority: int = 5,
     ) -> None:
         status = AgentStatus(status)
 
-        if detail:
-            text = f"{status.value}: {detail}"[:250]
-        else:
-            text = status.value
+        clean_message = " ".join(str(message).split())
+        status_text = f"{status.value}: {clean_message}"[:250]
 
         self.set("last_agent_status", status.value)
-        self.set("last_status_text", text)
+        self.set("last_status_text", status_text)
 
         if not self.presence:
             return
@@ -55,7 +65,7 @@ class StatusAwareAgent(Agent):
             self.presence.set_presence(
                 presence_type=PresenceType.UNAVAILABLE,
                 show=PresenceShow.NONE,
-                status=text,
+                status=status_text,
                 priority=0,
             )
             return
@@ -63,25 +73,27 @@ class StatusAwareAgent(Agent):
         self.presence.set_presence(
             presence_type=PresenceType.AVAILABLE,
             show=presence_show_for_status(status),
-            status=text,
+            status=status_text,
             priority=priority,
         )
 
-    def set_offline_detail(self, detail: str) -> None:
-        self.set("offline_detail", detail[:220])
+    def set_offline_message(self, message: str) -> None:
+        self.set("offline_message", " ".join(str(message).split())[:220])
 
     async def _async_stop(self) -> None:
-        offline_detail = self.get("offline_detail")
+        last_status = self.get("last_agent_status") or AgentStatus.ONLINE_IDLE.value
+        offline_message = self.get("offline_message")
 
-        if not offline_detail:
-            offline_detail = f"stopped at {utc_now_iso()}"
+        if not offline_message:
+            offline_message = f"stopped normally; previous status {last_status}"
 
         if self.presence:
             self.set_agent_status(
                 AgentStatus.OFFLINE,
-                offline_detail,
+                offline_message,
                 priority=0,
             )
+
             await asyncio.sleep(0.3)
 
         for behaviour in list(self.behaviours):

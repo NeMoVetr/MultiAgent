@@ -1,20 +1,28 @@
 import asyncio
-import spade
-from dotenv import load_dotenv
+import logging
 import os
 
-from ManagingАgents import SensorManagerAgent
-from SensorAgent import SM7005Agent, SM9560BAgent, THPWNJAgent, TBQ02CAgent
+import spade
+from dotenv import load_dotenv
+
+from logging_config import configure_logging
 
 load_dotenv()
+configure_logging()
+
+from IntegrationAgent import IrrigationAgent
+from SensorAgent import SM7005Agent, SM9560BAgent, THPWNJAgent, TBQ02CAgent, SensorManagerAgent
+
+logger = logging.getLogger(__name__)
 
 XMPP_HOST = os.getenv("XMPP_HOST", "localhost")
 XMPP_PORT = int(os.getenv("XMPP_PORT", "5222"))
 AGENT_PASSWORD = os.getenv("SPADE_AGENT_PASSWORD", "agent_password_123")
 
 MANAGER_JID = os.getenv("MANAGER_JID", f"manager@{XMPP_HOST}")
+ALGORITHM_AGENT_JID = os.getenv("ALGORITHM_AGENT_JID", f"irrigation@{XMPP_HOST}")
 
-AGENT_DEFINITIONS = [
+SENSOR_AGENT_DEFINITIONS = [
     ("sm9560b", SM9560BAgent),
     ("thpwnj", THPWNJAgent),
     ("tbq02c", TBQ02CAgent),
@@ -22,8 +30,16 @@ AGENT_DEFINITIONS = [
 ]
 
 
+def create_algorithm_agent() -> IrrigationAgent:
+    return IrrigationAgent(
+        ALGORITHM_AGENT_JID,
+        AGENT_PASSWORD,
+        port=XMPP_PORT,
+        verify_security=False,
+    )
 
-def create_manager_agent():
+
+def create_manager_agent() -> SensorManagerAgent:
     return SensorManagerAgent(
         MANAGER_JID,
         AGENT_PASSWORD,
@@ -35,55 +51,66 @@ def create_manager_agent():
 def create_sensor_agents():
     agents = []
 
-    for localpart, agent_class in AGENT_DEFINITIONS:
+    for localpart, agent_class in SENSOR_AGENT_DEFINITIONS:
         jid = f"{localpart}@{XMPP_HOST}"
 
         agent = agent_class(
             jid,
             AGENT_PASSWORD,
             port=XMPP_PORT,
+            verify_security=False,
         )
 
+        agent.set("manager_jid", MANAGER_JID)
         agents.append(agent)
 
     return agents
 
 
-async def main():
-    #manager_agent = create_manager_agent()
+async def main() -> None:
+    algorithm_agent = create_algorithm_agent()
+    manager_agent = create_manager_agent()
     sensor_agents = create_sensor_agents()
 
     started_agents = []
 
     try:
-        # print(f"Starting manager agent {manager_agent.jid}...")
-        # await manager_agent.start(auto_register=True)
-        # started_agents.append(manager_agent)
-        # print(f"✅ Manager agent started: {manager_agent.jid}")
+        logger.info("Starting algorithm agent: %s", algorithm_agent.jid)
+        await algorithm_agent.start(auto_register=True)
+        started_agents.append(algorithm_agent)
+        logger.info("Algorithm agent started: %s", algorithm_agent.jid)
+
+        logger.info("Starting manager agent: %s", manager_agent.jid)
+        await manager_agent.start(auto_register=True)
+        started_agents.append(manager_agent)
+        logger.info("Manager agent started: %s", manager_agent.jid)
 
         await asyncio.sleep(1)
 
         for agent in sensor_agents:
-            print(f"Starting sensor agent {agent.jid}...")
+            logger.info("Starting sensor agent: %s", agent.jid)
             await agent.start(auto_register=True)
             started_agents.append(agent)
-            print(f"✅ Sensor agent started: {agent.jid}")
+            logger.info("Sensor agent started: %s", agent.jid)
 
-        print("✅ All agents started.")
-        print("Press Ctrl+C to stop.")
+        logger.info("All agents started")
 
         while True:
             await asyncio.sleep(1)
 
     except KeyboardInterrupt:
-        print("Stopping by Ctrl+C...")
+        logger.info("Shutdown requested by user")
 
-    except Exception as e:
-        print(f"❌ Error while starting or running agents: {e}")
+    except asyncio.CancelledError:
+        logger.info("Main task cancelled")
+        raise
+
+    except Exception:
+        logger.exception("Application failed")
 
     finally:
         if started_agents:
-            print("Stopping agents...")
+            logger.info("Stopping agents")
 
             await asyncio.gather(
                 *[
@@ -94,7 +121,7 @@ async def main():
                 return_exceptions=True,
             )
 
-            print("✅ Agents stopped.")
+            logger.info("Agents stopped")
 
 
 if __name__ == "__main__":
