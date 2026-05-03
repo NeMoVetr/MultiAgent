@@ -1,0 +1,19 @@
+services:
+  multiagent:
+    build: .
+    container_name: multiagent_app
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    volumes:
+      - .:/app
+      - uv_cache:/root/.cache/uv
+
+    working_dir: /app
+
+    command: uv run python main.py
+
+volumes:
+  uv_cache:
