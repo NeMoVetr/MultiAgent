@@ -1,0 +1,243 @@
+[
+    {
+        "id": "e367cff56b45ef57",
+        "type": "tab",
+        "label": "Поток 1",
+        "disabled": false,
+        "info": "",
+        "env": []
+    },
+    {
+        "id": "0eecce421f8d8964",
+        "type": "mqtt out",
+        "z": "e367cff56b45ef57",
+        "name": "",
+        "topic": "",
+        "qos": "",
+        "retain": "",
+        "respTopic": "",
+        "contentType": "",
+        "userProps": "",
+        "correl": "",
+        "expiry": "",
+        "broker": "e26842503edc688b",
+        "x": 1050,
+        "y": 340,
+        "wires": []
+    },
+    {
+        "id": "4268a7ef86e9ab42",
+        "type": "inject",
+        "z": "e367cff56b45ef57",
+        "name": "data",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "topic",
+                "vt": "str"
+            }
+        ],
+        "repeat": "10",
+        "crontab": "",
+        "once": true,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 490,
+        "y": 380,
+        "wires": [
+            [
+                "bbb3e5cf99599580",
+                "69499409b420aeec",
+                "f96c793623402ea4",
+                "aa6f675f355d31d9"
+            ]
+        ]
+    },
+    {
+        "id": "bbb3e5cf99599580",
+        "type": "function",
+        "z": "e367cff56b45ef57",
+        "name": "SONBEST SM9560B",
+        "func": "let base = flow.get(\"luxBase\") || 28000;\nconst variation = Math.random() * 14000 - 7000;\nlet lux = Math.max(0, Math.min(65535, Math.round(base + variation)));\nflow.set(\"luxBase\", lux);\n\nmsg.topic = \"sensors/8f3e2a1c-9b7d-4e5f-a1b2-c3d4e5f6a7b8\";   // ← твой UUID\n\nmsg.payload = {\n    value: lux,\n    timestamp: new Date().toISOString()\n};\n\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 680,
+        "y": 300,
+        "wires": [
+            [
+                "1ff9a4811d2ccc62",
+                "0eecce421f8d8964"
+            ]
+        ]
+    },
+    {
+        "id": "1ff9a4811d2ccc62",
+        "type": "debug",
+        "z": "e367cff56b45ef57",
+        "name": "debug 1",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1060,
+        "y": 180,
+        "wires": []
+    },
+    {
+        "id": "69499409b420aeec",
+        "type": "function",
+        "z": "e367cff56b45ef57",
+        "name": "Veinasa THPW-NJ",
+        "func": "let windBase = flow.get(\"windBase\") || 4;\nlet tempBase = flow.get(\"tempBase\") || 19;\n\nconst windSpeed = Math.max(0, Math.round((windBase + Math.random()*5 - 2.5)*10)/10);\nconst windDir   = Math.floor(Math.random()*360);\nconst temp = Math.round((tempBase + Math.random()*8 - 4)*10)/10;\nconst hum  = Math.round(40 + Math.random()*50);\nconst press = Math.round(985 + Math.random()*35);\n\nflow.set(\"windBase\", windSpeed);\nflow.set(\"tempBase\", temp);\n\nmsg.topic = \"sensors/1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d\";   // ← твой UUID\n\nmsg.payload = {\n    wind_speed: windSpeed,\n    wind_direction: windDir,\n    temperature: temp,\n    humidity: hum,\n    pressure: press,\n    timestamp: new Date().toISOString()\n};\n\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 690,
+        "y": 340,
+        "wires": [
+            [
+                "63802861cf032011",
+                "0eecce421f8d8964"
+            ]
+        ]
+    },
+    {
+        "id": "63802861cf032011",
+        "type": "debug",
+        "z": "e367cff56b45ef57",
+        "name": "debug 2",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1060,
+        "y": 240,
+        "wires": []
+    },
+    {
+        "id": "f96c793623402ea4",
+        "type": "function",
+        "z": "e367cff56b45ef57",
+        "name": "XS-TBQ02C",
+        "func": "let radBase = flow.get(\"radBase\") || 720;\nlet radiation = Math.round(radBase + Math.random()*300 - 150);\nradiation = Math.max(0, Math.min(2000, radiation));\n\nflow.set(\"radBase\", radiation);\n\nmsg.topic = \"sensors/9f8e7d6c-5b4a-3f2e-1d0c-b9a8f7e6d5c4\";   // ← твой UUID\n\nmsg.payload = {\n    solar_radiation: radiation,\n    timestamp: new Date().toISOString()\n};\n\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 690,
+        "y": 380,
+        "wires": [
+            [
+                "4e60e63c58976e1f",
+                "0eecce421f8d8964"
+            ]
+        ]
+    },
+    {
+        "id": "4e60e63c58976e1f",
+        "type": "debug",
+        "z": "e367cff56b45ef57",
+        "name": "debug 3",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1060,
+        "y": 420,
+        "wires": []
+    },
+    {
+        "id": "aa6f675f355d31d9",
+        "type": "function",
+        "z": "e367cff56b45ef57",
+        "name": "SONBEST SM7005",
+        "func": "let intensity = flow.get(\"rainIntensity\") || 0;\nif (Math.random() < 0.08) {\n    intensity = Math.random() < 0.35 ? 0 : Math.random() * 4;\n}\nlet accum = (flow.get(\"rainAccum\") || 0) + (intensity / 12);\n\nflow.set(\"rainIntensity\", intensity);\nflow.set(\"rainAccum\", accum);\n\nmsg.topic = \"sensors/4b5c6d7e-8f9a-0b1c-2d3e-4f5a6b7c8d9e\";   // ← твой UUID\n\nmsg.payload = {\n    rain_intensity: Math.round(intensity*10)/10,\n    rain_accum_today: Math.round(accum*10)/10,\n    timestamp: new Date().toISOString()\n};\n\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 710,
+        "y": 420,
+        "wires": [
+            [
+                "061e4a7bcdf48ea8",
+                "0eecce421f8d8964"
+            ]
+        ]
+    },
+    {
+        "id": "061e4a7bcdf48ea8",
+        "type": "debug",
+        "z": "e367cff56b45ef57",
+        "name": "debug 4",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1020,
+        "y": 460,
+        "wires": []
+    },
+    {
+        "id": "e26842503edc688b",
+        "type": "mqtt-broker",
+        "name": "test1",
+        "broker": "mosquitto",
+        "port": 1883,
+        "clientid": "",
+        "autoConnect": true,
+        "usetls": false,
+        "protocolVersion": 4,
+        "keepalive": 60,
+        "cleansession": true,
+        "autoUnsubscribe": true,
+        "birthTopic": "",
+        "birthQos": "0",
+        "birthRetain": "false",
+        "birthPayload": "",
+        "birthMsg": {},
+        "closeTopic": "",
+        "closeQos": "0",
+        "closeRetain": "false",
+        "closePayload": "",
+        "closeMsg": {},
+        "willTopic": "",
+        "willQos": "0",
+        "willRetain": "false",
+        "willPayload": "",
+        "willMsg": {},
+        "userProps": "",
+        "sessionExpiry": ""
+    }
+]
