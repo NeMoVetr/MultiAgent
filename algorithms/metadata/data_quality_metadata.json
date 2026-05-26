@@ -1,0 +1,238 @@
+{
+  "version": "2.0",
+  "description": "Universal metadata-driven data quality configuration. New ordinary physical sensors are added here without changing data_quality.py.",
+  "default_history_size": 5,
+  "sensors": {
+    "Veinasa_THPW_NJ": {
+      "description": "5-in-1 weather sensor: wind speed, wind direction, air temperature, air humidity, air pressure.",
+      "parameters": {
+        "wind_speed_ms": {
+          "unit": "m/s",
+          "min": 0,
+          "max": 45,
+          "initial_history": [0, 0, 0, 0, 0],
+          "rules": [
+            {"type": "range_check", "replacement": "median_history"},
+            {"type": "jump_check", "max_delta_from_median": 15, "replacement": "median_history"},
+            {"type": "clamp"}
+          ]
+        },
+        "wind_direction_deg": {
+          "unit": "degree",
+          "min": 0,
+          "max": 359,
+          "initial_history": [0, 0, 0, 0, 0],
+          "rules": [
+            {"type": "range_check", "replacement": "median_history"},
+            {"type": "related_parameter_minimum", "related_parameter": "wind_speed_ms", "minimum": 0.8, "replacement": "median_history"},
+            {"type": "circular_jump_check", "max_circular_delta_from_median": 120, "circular_max": 360, "replacement": "median_history"},
+            {"type": "clamp"}
+          ]
+        },
+        "air_temperature_c": {
+          "unit": "°C",
+          "min": -40,
+          "max": 80,
+          "initial_history": [20, 20, 20, 20, 20],
+          "rules": [
+            {"type": "range_check", "replacement": "median_history"},
+            {"type": "jump_check", "max_delta_from_median": 5, "replacement": "median_history"},
+            {"type": "clamp"}
+          ]
+        },
+        "air_humidity_percent": {
+          "unit": "%RH",
+          "min": 0,
+          "max": 100,
+          "initial_history": [50, 50, 50, 50, 50],
+          "rules": [
+            {"type": "range_check", "replacement": "median_history"},
+            {"type": "jump_check", "max_delta_from_median": 20, "replacement": "median_history"},
+            {"type": "clamp"}
+          ]
+        },
+        "air_pressure_hpa": {
+          "unit": "hPa",
+          "min": 300,
+          "max": 1100,
+          "initial_history": [1013, 1013, 1013, 1013, 1013],
+          "rules": [
+            {"type": "range_check", "replacement": "median_history"},
+            {"type": "jump_check", "max_delta_from_median": 5, "replacement": "median_history"},
+            {"type": "clamp"}
+          ]
+        }
+      }
+    },
+
+    "SONBEST_SM9560B": {
+      "description": "Illuminance sensor.",
+      "parameters": {
+        "illuminance_lux": {
+          "unit": "lx",
+          "min": 0,
+          "max": 65535,
+          "initial_history": [0, 0, 0, 0, 0],
+          "rules": [
+            {"type": "range_check", "replacement": "median_history"},
+            {"type": "night_zero", "threshold": 5},
+            {"type": "jump_check", "max_delta_from_median": 20000, "replacement": "median_history", "required_context": {"sun_state": "twilight"}},
+            {"type": "jump_check", "max_delta_from_median": 50000, "replacement": "median_history", "required_context": {"sun_state": "day"}},
+            {"type": "clamp"}
+          ]
+        }
+      }
+    },
+
+    "XS_TBQ02C": {
+      "description": "Total solar radiation sensor.",
+      "parameters": {
+        "solar_radiation_wm2": {
+          "unit": "W/m²",
+          "min": 0,
+          "max": 2000,
+          "initial_history": [0, 0, 0, 0, 0],
+          "rules": [
+            {"type": "negative_to_zero"},
+            {"type": "range_check", "replacement": "median_history"},
+            {"type": "night_zero", "threshold": 2},
+            {"type": "jump_check", "max_delta_from_median": 300, "replacement": "median_history", "required_context": {"sun_state": "twilight"}},
+            {"type": "jump_check", "max_delta_from_median": 800, "replacement": "median_history", "required_context": {"sun_state": "day"}},
+            {
+              "type": "cross_sensor_check",
+              "required_context": {"sun_state": "day"},
+              "value_above": 500,
+              "related": [{"key": "illuminance_lux", "below": 100}],
+              "replacement": "median_history"
+            },
+            {"type": "clamp"}
+          ]
+        }
+      }
+    },
+
+    "SONBEST_XM8504": {
+      "description": "Rain gauge. It can process interval rain values and cumulative rain totals.",
+      "parameters": {
+        "rain_interval_mm": {
+          "unit": "mm",
+          "min": 0,
+          "max": 10000,
+          "resolution": 0.2,
+          "initial_history": [0, 0, 0, 0, 0],
+          "rules": [
+            {"type": "negative_to_zero"},
+            {"type": "max_rate", "max_per_minute": 4, "default_interval_minutes": 10, "replacement": "median_history"},
+            {"type": "resolution_rounding", "step": 0.2, "decimals": 1},
+            {"type": "jump_check", "max_delta_from_median": 10, "replacement": "median_history"},
+            {"type": "clamp"}
+          ]
+        },
+        "rain_total_mm": {
+          "unit": "mm",
+          "min": 0,
+          "max": 1000000,
+          "initial_history": [0, 0, 0, 0, 0],
+          "output_parameter": "rain_interval_mm",
+          "output_initial_history": [0, 0, 0, 0, 0],
+          "rules": [
+            {"type": "range_check", "replacement": "median_history"},
+            {"type": "monotonic_counter_delta"},
+            {"type": "max_rate", "max_per_minute": 4, "default_interval_minutes": 10, "replacement": "median_history"},
+            {"type": "resolution_rounding", "step": 0.2, "decimals": 1},
+            {"type": "clamp"}
+          ]
+        }
+      }
+    },
+
+    "TR_4H01X": {
+      "description": "4-probe soil moisture sensor.",
+      "parameters": {
+        "soil_moisture_probe_1_percent": {
+          "unit": "%",
+          "min": 0,
+          "max": 100,
+          "resolution": 0.1,
+          "initial_history": [24, 24, 24, 24, 24],
+          "rules": [
+            {"type": "range_check", "replacement": "median_history"},
+            {"type": "rise_without_event_check", "max_rise_from_median": 15, "event_context_key": "rain_or_irrigation", "replacement": "median_history"},
+            {"type": "fall_check", "max_fall_from_median": 5, "replacement": "median_history"},
+            {"type": "clamp"}
+          ]
+        },
+        "soil_moisture_probe_2_percent": {
+          "unit": "%",
+          "min": 0,
+          "max": 100,
+          "resolution": 0.1,
+          "initial_history": [24, 24, 24, 24, 24],
+          "rules": [
+            {"type": "range_check", "replacement": "median_history"},
+            {"type": "rise_without_event_check", "max_rise_from_median": 15, "event_context_key": "rain_or_irrigation", "replacement": "median_history"},
+            {"type": "fall_check", "max_fall_from_median": 5, "replacement": "median_history"},
+            {"type": "clamp"}
+          ]
+        },
+        "soil_moisture_probe_3_percent": {
+          "unit": "%",
+          "min": 0,
+          "max": 100,
+          "resolution": 0.1,
+          "initial_history": [24, 24, 24, 24, 24],
+          "rules": [
+            {"type": "range_check", "replacement": "median_history"},
+            {"type": "rise_without_event_check", "max_rise_from_median": 15, "event_context_key": "rain_or_irrigation", "replacement": "median_history"},
+            {"type": "fall_check", "max_fall_from_median": 5, "replacement": "median_history"},
+            {"type": "clamp"}
+          ]
+        },
+        "soil_moisture_probe_4_percent": {
+          "unit": "%",
+          "min": 0,
+          "max": 100,
+          "resolution": 0.1,
+          "initial_history": [24, 24, 24, 24, 24],
+          "rules": [
+            {"type": "range_check", "replacement": "median_history"},
+            {"type": "rise_without_event_check", "max_rise_from_median": 15, "event_context_key": "rain_or_irrigation", "replacement": "median_history"},
+            {"type": "fall_check", "max_fall_from_median": 5, "replacement": "median_history"},
+            {"type": "clamp"}
+          ]
+        }
+      },
+      "sensor_rules": [
+        {
+          "type": "multi_parameter_median",
+          "parameters": [
+            "soil_moisture_probe_1_percent",
+            "soil_moisture_probe_2_percent",
+            "soil_moisture_probe_3_percent",
+            "soil_moisture_probe_4_percent"
+          ],
+          "max_delta_from_group_median": 20,
+          "required_context": {"probes_same_depth": true}
+        }
+      ]
+    },
+
+    "GENERIC_WATER_LEVEL_SENSOR": {
+      "description": "Example of a new ordinary physical sensor added only through JSON. Python code is not changed for this sensor.",
+      "parameters": {
+        "water_level_cm": {
+          "unit": "cm",
+          "min": 0,
+          "max": 300,
+          "resolution": 0.1,
+          "initial_history": [100, 100, 100, 100, 100],
+          "rules": [
+            {"type": "range_check", "replacement": "median_history"},
+            {"type": "jump_check", "max_delta_from_median": 60, "replacement": "median_history"},
+            {"type": "clamp"}
+          ]
+        }
+      }
+    }
+  }
+}

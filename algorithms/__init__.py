@@ -2,6 +2,9 @@ from .irrigation_algorithm import IrrigationAlgorithm
 from .time_normalizer import TimestampNormalizationError, normalize_gateway_record
 from .algorithm_contract import AlgorithmConfig, AlgorithmInputRecord, AlgorithmMode, AlgorithmResult, BaseAlgorithm, OutputStorageStrategy
 from .time_normalizer import TimeNormalizationAlgorithm
+from .data_quality import DataQuality
+from .irrigator import Irrigation
+import irrigator
 
 __all__ = [
     "IrrigationAlgorithm",
@@ -17,5 +20,11 @@ __all__ = [
     "BaseAlgorithm",
     "OutputStorageStrategy",
 
-    "TimeNormalizationAlgorithm"
+    "TimeNormalizationAlgorithm",
+
+
+
+    "DataQuality",
+    "Irrigation"
+
 ]

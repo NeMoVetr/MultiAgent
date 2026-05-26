@@ -5,6 +5,12 @@ description = "Add your description here"
 requires-python = ">=3.12"
 dependencies = [
     "aiomqtt>=2.5.1",
+    "geocoder>=1.38.1",
+    "numpy>=2.4.6",
+    "pandas>=3.0.3",
+    "pyet>=1.4.0",
+    "pytest>=9.0.3",
     "python-dotenv>=1.2.2",
+    "requests>=2.34.2",
     "spade>=4.1.2",
 ]
