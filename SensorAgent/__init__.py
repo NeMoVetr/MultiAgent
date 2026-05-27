@@ -1,13 +1,15 @@
-from .sesnor_agent import SM9560BAgent, THPWNJAgent, TBQ02CAgent, SM7005Agent
-from .manager_agent import SensorManagerAgent
+from .sensor_agent import (
+    SM9560BAgent,
+    TBQ02CAgent,
+    THPWNJAgent,
+    TR4H01XAgent,
+    XM8504Agent,
+)
 
-
-__all__=[
-    "SensorManagerAgent",
-
+__all__ = [
     "SM9560BAgent",
-    "THPWNJAgent",
     "TBQ02CAgent",
-    "SM7005Agent",
-
+    "THPWNJAgent",
+    "TR4H01XAgent",
+    "XM8504Agent",
 ]

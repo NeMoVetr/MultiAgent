@@ -29,6 +29,8 @@ from algorithms import DataQuality
 
 BASE_DIR = Path(__file__).resolve().parent
 SOURCE_METADATA_PATH = BASE_DIR / "data_quality_metadata.json"
+if not SOURCE_METADATA_PATH.exists():
+    SOURCE_METADATA_PATH = BASE_DIR.parent / "algorithms" / "metadata" / "data_quality_metadata.json"
 
 
 def _read_metadata() -> Dict[str, Any]:

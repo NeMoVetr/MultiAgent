@@ -287,9 +287,8 @@ def test_irrigation_accepts_values_from_data_quality_output(monkeypatch, patched
     assert agent.get_decision() is True
 
 
-def test_constructor_stores_input_values(monkeypatch, patched_external_services):
-    patch_pyet_et0(monkeypatch, et0_value=4.0)
-    agent = make_agent(
+def test_constructor_stores_input_values():
+    agent = Irrigation(
         soil_raw=[15.0, 16.0, 17.0, 18.0],
         T_mean=29.0,
         RH_mean=40.0,
@@ -297,6 +296,9 @@ def test_constructor_stores_input_values(monkeypatch, patched_external_services)
         pressure_hpa=1000.0,
         solar_radiation_wm2=500.0,
         rain_mm=1.0,
+        lat=48.708,
+        lng=44.514,
+        elevation=100.0,
     )
 
     assert agent.soil_raw == [15.0, 16.0, 17.0, 18.0]

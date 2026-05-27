@@ -1,11 +1,10 @@
 import asyncio
+import logging
+import os
 import sys
 
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-import logging
-import os
 
 import spade
 from dotenv import load_dotenv
@@ -15,9 +14,15 @@ from logging_config import configure_logging
 load_dotenv()
 configure_logging()
 
-from IntegrationAgent import GenericAlgorithmAgent
-from SensorAgent import SM7005Agent, SM9560BAgent, THPWNJAgent, TBQ02CAgent, SensorManagerAgent
-from algorithms import TimeNormalizationAlgorithm, IrrigationAlgorithm
+from DataQualityAgent import DataQualityAgent
+from IrrigatorAgent import IrrigatorAgent
+from SensorAgent import (
+    SM9560BAgent,
+    TBQ02CAgent,
+    THPWNJAgent,
+    TR4H01XAgent,
+    XM8504Agent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,45 +30,43 @@ XMPP_HOST = os.getenv("XMPP_HOST", "localhost")
 XMPP_PORT = int(os.getenv("XMPP_PORT", "5222"))
 AGENT_PASSWORD = os.getenv("SPADE_AGENT_PASSWORD", "agent_password_123")
 
-MANAGER_JID = os.getenv("MANAGER_JID", f"manager@{XMPP_HOST}")
-NORMALIZER_AGENT_JID = os.getenv("NORMALIZER_AGENT_JID", f"normalizer@{XMPP_HOST}")
-ALGORITHM_AGENT_JID = os.getenv("ALGORITHM_AGENT_JID", f"irrigation@{XMPP_HOST}")
+DATA_QUALITY_AGENT_JID = os.getenv(
+    "DATA_QUALITY_AGENT_JID",
+    f"data_quality@{XMPP_HOST}",
+)
+IRRIGATOR_AGENT_JID = os.getenv(
+    "IRRIGATOR_AGENT_JID",
+    f"irrigator@{XMPP_HOST}",
+)
 
 SENSOR_AGENT_DEFINITIONS = [
     ("sm9560b", SM9560BAgent),
     ("thpwnj", THPWNJAgent),
     ("tbq02c", TBQ02CAgent),
-    ("sm7005", SM7005Agent),
+    ("xm8504", XM8504Agent),
+    ("tr4h01x", TR4H01XAgent),
 ]
 
 
-def create_normalizer_agent() -> GenericAlgorithmAgent:
-    return GenericAlgorithmAgent(
-        NORMALIZER_AGENT_JID,
+def create_data_quality_agent() -> DataQualityAgent:
+    agent = DataQualityAgent(
+        DATA_QUALITY_AGENT_JID,
         AGENT_PASSWORD,
-        algorithm=TimeNormalizationAlgorithm.from_env(),
         port=XMPP_PORT,
         verify_security=False,
         priority=7,
     )
+    agent.set("irrigator_agent_jid", IRRIGATOR_AGENT_JID)
+    return agent
 
 
-def create_irrigation_agent() -> GenericAlgorithmAgent:
-    return GenericAlgorithmAgent(
-        ALGORITHM_AGENT_JID,
+def create_irrigator_agent() -> IrrigatorAgent:
+    return IrrigatorAgent(
+        IRRIGATOR_AGENT_JID,
         AGENT_PASSWORD,
-        algorithm=IrrigationAlgorithm.from_env(),
         port=XMPP_PORT,
         verify_security=False,
         priority=8,
-    )
-
-def create_manager_agent() -> SensorManagerAgent:
-    return SensorManagerAgent(
-        MANAGER_JID,
-        AGENT_PASSWORD,
-        port=XMPP_PORT,
-        verify_security=False,
     )
 
 
@@ -72,43 +75,36 @@ def create_sensor_agents():
 
     for localpart, agent_class in SENSOR_AGENT_DEFINITIONS:
         jid = f"{localpart}@{XMPP_HOST}"
-
         agent = agent_class(
             jid,
             AGENT_PASSWORD,
             port=XMPP_PORT,
             verify_security=False,
         )
-
-        agent.set("manager_jid", MANAGER_JID)
+        agent.set("data_quality_agent_jid", DATA_QUALITY_AGENT_JID)
         agents.append(agent)
 
     return agents
 
 
 async def main() -> None:
-    irrigation_agent = create_irrigation_agent()
-    normalizer_agent = create_normalizer_agent()
-    manager_agent = create_manager_agent()
+    irrigator_agent = create_irrigator_agent()
+    data_quality_agent = create_data_quality_agent()
     sensor_agents = create_sensor_agents()
 
     started_agents = []
 
     try:
-        logger.info("Starting irrigation algorithm agent: %s", irrigation_agent.jid)
-        await irrigation_agent.start(auto_register=True)
-        started_agents.append(irrigation_agent)
-        logger.info("Irrigation algorithm agent started: %s", irrigation_agent.jid)
+        logger.info("Starting irrigator agent: %s", irrigator_agent.jid)
+        await irrigator_agent.start(auto_register=True)
+        started_agents.append(irrigator_agent)
+        logger.info("Irrigator agent started: %s", irrigator_agent.jid)
 
-        logger.info("Starting time normalizer agent: %s", normalizer_agent.jid)
-        await normalizer_agent.start(auto_register=True)
-        started_agents.append(normalizer_agent)
-        logger.info("Time normalizer agent started: %s", normalizer_agent.jid)
+        logger.info("Starting data quality agent: %s", data_quality_agent.jid)
+        await data_quality_agent.start(auto_register=True)
+        started_agents.append(data_quality_agent)
+        logger.info("Data quality agent started: %s", data_quality_agent.jid)
 
-        logger.info("Starting manager agent: %s", manager_agent.jid)
-        await manager_agent.start(auto_register=True)
-        started_agents.append(manager_agent)
-        logger.info("Manager agent started: %s", manager_agent.jid)
         await asyncio.sleep(1)
 
         for agent in sensor_agents:
