@@ -14,15 +14,14 @@ call real IP geocoding or Open-Elevation. pyet.pm_fao56 is also monkeypatched
 in decision tests to make expected results deterministic.
 """
 
-import math
 from typing import Any, Dict
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from algorithms import irrigator
 from algorithms import Irrigation
+from algorithms import irrigator
 
 
 # ---------------------------------------------------------------------------
@@ -76,10 +75,10 @@ def make_agent(**overrides) -> Irrigation:
 
 
 def expected_decision_by_formula(
-    soil_raw: list[float],
-    et0: float,
-    rain_mm: float,
-    wind_speed: float,
+        soil_raw: list[float],
+        et0: float,
+        rain_mm: float,
+        wind_speed: float,
 ) -> bool:
     """Mirror the calculation implemented inside Irrigation.__calculate()."""
     theta_fc = 0.24
@@ -208,7 +207,8 @@ def test_pyet_receives_prepared_series_and_converted_solar_radiation(monkeypatch
         ("high_et0_changes_raw_threshold", [20.0, 20.0, 20.0, 20.0], 20.0, 0.0, 1.8),
     ],
 )
-def test_decision_matches_formula(monkeypatch, patched_external_services, case_name, soil_raw, et0, rain_mm, wind_speed):
+def test_decision_matches_formula(monkeypatch, patched_external_services, case_name, soil_raw, et0, rain_mm,
+                                  wind_speed):
     patch_pyet_et0(monkeypatch, et0_value=et0)
 
     agent = make_agent(soil_raw=soil_raw, rain_mm=rain_mm, wind_speed=wind_speed)
@@ -296,9 +296,7 @@ def test_constructor_stores_input_values():
         pressure_hpa=1000.0,
         solar_radiation_wm2=500.0,
         rain_mm=1.0,
-        lat=48.708,
-        lng=44.514,
-        elevation=100.0,
+
     )
 
     assert agent.soil_raw == [15.0, 16.0, 17.0, 18.0]
@@ -308,6 +306,3 @@ def test_constructor_stores_input_values():
     assert agent.pressure_hpa == pytest.approx(1000.0)
     assert agent.solar_radiation_wm2 == pytest.approx(500.0)
     assert agent.rain_mm == pytest.approx(1.0)
-    assert agent.lat == pytest.approx(48.708)
-    assert agent.lng == pytest.approx(44.514)
-    assert agent.elevation == pytest.approx(100.0)

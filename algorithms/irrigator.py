@@ -1,11 +1,13 @@
+import logging
+
 import geocoder
 import numpy as np
 import pandas as pd
 import pyet
 import requests
-import logging
 
 logger = logging.getLogger(__name__)
+
 
 class Irrigation:
     """
@@ -30,9 +32,6 @@ class Irrigation:
             pressure_hpa: float,  # hPa
             solar_radiation_wm2: float,  # Вт/м²
             rain_mm: float = 0.0,  # мм
-            lat: float | None = None,
-            lng: float | None = None,
-            elevation: float | None = None,
 
     ):
         """
@@ -45,16 +44,9 @@ class Irrigation:
         self.pressure_hpa = pressure_hpa
         self.solar_radiation_wm2 = solar_radiation_wm2
         self.rain_mm = rain_mm
-        if lat is None or lng is None:
-            self.lat, self.lng = self.__get_location()
-        else:
-            self.lat = float(lat)
-            self.lng = float(lng)
 
-        if elevation is None:
-            self.elevation = self.__get_elevation(self.lat, self.lng)
-        else:
-            self.elevation = float(elevation)
+        self.lat, self.lng = self.__get_location()
+        self.elevation = self.__get_elevation(self.lat, self.lng)
 
     @staticmethod
     def __get_location() -> tuple[float, float]:

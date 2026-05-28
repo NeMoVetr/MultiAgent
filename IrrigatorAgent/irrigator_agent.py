@@ -10,9 +10,9 @@ from dotenv import load_dotenv
 from spade.behaviour import CyclicBehaviour, PeriodicBehaviour
 from spade.template import Template
 
-from algorithms.irrigator import Irrigation
 from DataQualityAgent.data_quality_agent import QUALITY_DATA_ONTOLOGY
 from StatusAgent import AgentStatus, StatusAwareAgent, utc_now_iso
+from algorithms.irrigator import Irrigation
 
 load_dotenv()
 
@@ -84,10 +84,6 @@ class IrrigatorAgent(StatusAwareAgent):
             os.getenv("IRRIGATION_DECISION_FILE", "./data/irrigation_decision.json")
         )
         self.output_file.parent.mkdir(parents=True, exist_ok=True)
-
-        self.latitude = env_float("IRRIGATION_LATITUDE", 48.708)
-        self.longitude = env_float("IRRIGATION_LONGITUDE", 44.514)
-        self.elevation = env_float("IRRIGATION_ELEVATION_M", 100.0)
 
         self.set_agent_status(
             AgentStatus.ONLINE_IDLE,
@@ -197,9 +193,7 @@ class IrrigatorAgent(StatusAwareAgent):
             pressure_hpa=values["air_pressure_hpa"],
             solar_radiation_wm2=values["solar_radiation_wm2"],
             rain_mm=values["rain_interval_mm"],
-            lat=self.latitude,
-            lng=self.longitude,
-            elevation=self.elevation,
+
         )
         return bool(irrigation.get_decision())
 
