@@ -5,6 +5,7 @@ import os
 import time
 from pathlib import Path
 from typing import Any
+import csv
 
 from dotenv import load_dotenv
 from spade.behaviour import CyclicBehaviour, PeriodicBehaviour
@@ -18,6 +19,29 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+IRRIGATION_INPUT_COLUMNS = [
+    "air_temperature_c",
+    "air_humidity_percent",
+    "air_pressure_hpa",
+    "wind_speed_ms",
+    "wind_direction_deg",
+    "illuminance_lux",
+    "solar_radiation_wm2",
+    "rain_interval_mm",
+    "soil_moisture_probe_1_percent",
+    "soil_moisture_probe_2_percent",
+    "soil_moisture_probe_3_percent",
+    "soil_moisture_probe_4_percent",
+]
+
+IRRIGATION_CSV_COLUMNS = [
+    "timestamp",
+    "decided_at",
+    "decision",
+    *IRRIGATION_INPUT_COLUMNS,
+    "inputs_json",
+    "sensor_timestamps_json",
+]
 
 def env_float(name: str, default: float) -> float:
     try:
@@ -85,6 +109,15 @@ class IrrigatorAgent(StatusAwareAgent):
         )
         self.output_file.parent.mkdir(parents=True, exist_ok=True)
 
+        self.csv_output_file = Path(
+            os.getenv(
+                "IRRIGATION_DECISION_CSV_FILE",
+                str(self.output_file.with_suffix(".csv")),
+            )
+        )
+        self.csv_output_file.parent.mkdir(parents=True, exist_ok=True)
+
+
         self.set_agent_status(
             AgentStatus.ONLINE_IDLE,
             "irrigator waiting for clean sensor data",
@@ -148,6 +181,7 @@ class IrrigatorAgent(StatusAwareAgent):
         self.last_decision_at_monotonic = time.monotonic()
         payload = self.build_decision_payload(decision)
         self.write_decision(payload)
+        self.append_decision_csv(payload)
 
         self.set_agent_status(
             AgentStatus.WORKING,
@@ -257,3 +291,45 @@ class IrrigatorAgent(StatusAwareAgent):
             os.fsync(file.fileno())
 
         os.replace(tmp_file, self.output_file)
+
+    def append_decision_csv(self, payload: dict[str, Any]) -> None:
+        inputs = dict(payload.get("inputs") or {})
+        csv_file = getattr(
+            self,
+            "csv_output_file",
+            self.output_file.with_suffix(".csv"),
+        )
+        csv_file.parent.mkdir(parents=True, exist_ok=True)
+
+        row = {
+            "timestamp": payload.get("timestamp"),
+            "decided_at": payload.get("decided_at"),
+            "decision": payload.get("value"),
+            "inputs_json": json.dumps(inputs, ensure_ascii=False, sort_keys=True),
+            "sensor_timestamps_json": json.dumps(
+                payload.get("sensor_timestamps") or {},
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        }
+
+        row.update({
+            column: inputs.get(column)
+            for column in IRRIGATION_INPUT_COLUMNS
+        })
+
+        write_header = not csv_file.exists() or csv_file.stat().st_size == 0
+
+        with csv_file.open("a", encoding="utf-8", newline="") as file:
+            writer = csv.DictWriter(
+                file,
+                fieldnames=IRRIGATION_CSV_COLUMNS,
+                extrasaction="ignore",
+            )
+
+            if write_header:
+                writer.writeheader()
+
+            writer.writerow(row)
+            file.flush()
+            os.fsync(file.fileno())

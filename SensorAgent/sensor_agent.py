@@ -6,7 +6,7 @@ import os
 import random
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from dotenv import load_dotenv
@@ -30,13 +30,36 @@ def env_float(name: str, default: float) -> float:
         return default
 
 
-def utc_hour_fraction() -> float:
-    now = datetime.now(timezone.utc)
+def utc_iso(moment: datetime) -> str:
+    return (
+        moment.astimezone(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def parse_utc_datetime(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def floor_datetime_to_step(moment: datetime, step_seconds: int) -> datetime:
+    moment = moment.astimezone(timezone.utc)
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    seconds = int((moment - epoch).total_seconds())
+    floored_seconds = seconds - seconds % step_seconds
+    return epoch + timedelta(seconds=floored_seconds)
+
+
+def utc_hour_fraction(moment: datetime | None = None) -> float:
+    now = moment.astimezone(timezone.utc) if moment else datetime.now(timezone.utc)
     return now.hour + now.minute / 60.0 + now.second / 3600.0
 
 
-def sun_state() -> str:
-    hour = utc_hour_fraction()
+def sun_state(moment: datetime | None = None) -> str:
+    hour = utc_hour_fraction(moment)
 
     if 6.0 <= hour < 8.0 or 18.0 <= hour < 20.0:
         return "twilight"
@@ -47,8 +70,8 @@ def sun_state() -> str:
     return "night"
 
 
-def day_curve() -> float:
-    hour = utc_hour_fraction()
+def day_curve(moment: datetime | None = None) -> float:
+    hour = utc_hour_fraction(moment)
     value = math.sin((hour - 6.0) / 12.0 * math.pi)
     return max(0.0, value)
 
@@ -97,14 +120,39 @@ class SensorAgentBase(StatusAwareAgent):
         )
         self.set_offline_message("stopped normally")
 
+        self.simulation_time_step_minutes = env_float(
+            "SENSOR_SIMULATION_TIME_STEP_MINUTES",
+            5.0,
+        )
+        self.simulation_time_step_seconds = max(
+            1,
+            int(self.simulation_time_step_minutes * 60),
+        )
+        self.simulation_time_step = timedelta(
+            seconds=self.simulation_time_step_seconds,
+        )
+
+        start_raw = os.getenv("SENSOR_SIMULATION_START_ISO")
+        if start_raw:
+            self.next_simulated_at = parse_utc_datetime(start_raw)
+        else:
+            self.next_simulated_at = floor_datetime_to_step(
+                datetime.now(timezone.utc),
+                self.simulation_time_step_seconds,
+            )
+
         period = env_float("SENSOR_SIMULATION_PERIOD_SECONDS", 5.0)
         self.add_behaviour(SensorSimulationBehaviour(period=period))
 
         logger.info(
-            "Sensor simulator configured: sensor_id=%s, source=%s, data_quality=%s",
+            "Sensor simulator configured: sensor_id=%s, source=%s, data_quality=%s, "
+            "real_period=%ss, simulated_step=%smin, simulated_start=%s",
             self.sensor_id,
             self.source_name,
             self.data_quality_agent_jid,
+            period,
+            self.simulation_time_step_minutes,
+            utc_iso(self.next_simulated_at),
         )
 
     def should_emit_anomaly(self) -> bool:
@@ -154,12 +202,20 @@ class SensorAgentBase(StatusAwareAgent):
                 error,
             )
 
-    def build_context(self, result: SensorSimulationResult) -> dict[str, Any]:
-        period_seconds = env_float("SENSOR_SIMULATION_PERIOD_SECONDS", 5.0)
+    def take_simulated_timestamp(self) -> datetime:
+        simulated_at = self.next_simulated_at
+        self.next_simulated_at = simulated_at + self.simulation_time_step
+        return simulated_at
+
+    def build_context(
+        self,
+        result: SensorSimulationResult,
+        simulated_at: datetime | None = None,
+    ) -> dict[str, Any]:
         context: dict[str, Any] = {
             "communication_ok": True,
-            "sun_state": sun_state(),
-            "polling_interval_minutes": max(period_seconds / 60.0, 1.0),
+            "sun_state": sun_state(simulated_at),
+            "polling_interval_minutes": self.simulation_time_step_minutes,
         }
 
         if self.sensor_name == "TR_4H01X":
@@ -173,7 +229,10 @@ class SensorAgentBase(StatusAwareAgent):
 
         return context
 
-    def simulate_values(self) -> SensorSimulationResult:
+    def simulate_values(
+        self,
+        simulated_at: datetime | None = None,
+    ) -> SensorSimulationResult:
         raise NotImplementedError
 
 
@@ -182,8 +241,9 @@ class SensorSimulationBehaviour(PeriodicBehaviour):
         logger.info("Sensor simulation started: %s", self.agent.sensor_id)
 
     async def run(self) -> None:
-        result = self.agent.simulate_values()
-        timestamp = utc_now_iso()
+        simulated_at = self.agent.take_simulated_timestamp()
+        result = self.agent.simulate_values(simulated_at)
+        timestamp = utc_iso(simulated_at)
         body = {
             "kind": "sensor_sample",
             "sensor_id": self.agent.sensor_id,
@@ -191,7 +251,7 @@ class SensorSimulationBehaviour(PeriodicBehaviour):
             "source_name": self.agent.source_name,
             "timestamp": timestamp,
             "values": result.values,
-            "context": self.agent.build_context(result),
+            "context": self.agent.build_context(result, simulated_at),
             "is_anomaly": result.anomaly,
             "anomaly_type": result.anomaly_type,
             "sent_at": utc_now_iso(),
@@ -222,10 +282,13 @@ class SM9560BAgent(SensorAgentBase):
             source_name="SONBEST SM9560B",
         )
 
-    def simulate_values(self) -> SensorSimulationResult:
+    def simulate_values(
+        self,
+        simulated_at: datetime | None = None,
+    ) -> SensorSimulationResult:
         anomaly = self.should_emit_anomaly()
-        state = sun_state()
-        curve = day_curve()
+        state = sun_state(simulated_at)
+        curve = day_curve(simulated_at)
 
         if anomaly:
             if state == "night":
@@ -258,9 +321,12 @@ class THPWNJAgent(SensorAgentBase):
             source_name="Veinasa THPW-NJ",
         )
 
-    def simulate_values(self) -> SensorSimulationResult:
+    def simulate_values(
+        self,
+        simulated_at: datetime | None = None,
+    ) -> SensorSimulationResult:
         anomaly = self.should_emit_anomaly()
-        curve = day_curve()
+        curve = day_curve(simulated_at)
 
         if anomaly:
             return SensorSimulationResult(
@@ -300,10 +366,13 @@ class TBQ02CAgent(SensorAgentBase):
             source_name="XS-TBQ02C Total Radiation Sensor",
         )
 
-    def simulate_values(self) -> SensorSimulationResult:
+    def simulate_values(
+        self,
+        simulated_at: datetime | None = None,
+    ) -> SensorSimulationResult:
         anomaly = self.should_emit_anomaly()
-        state = sun_state()
-        curve = day_curve()
+        state = sun_state(simulated_at)
+        curve = day_curve(simulated_at)
 
         if anomaly:
             value = self.random.choice([-25, 2600, 600 if state == "night" else None])
@@ -331,7 +400,10 @@ class XM8504Agent(SensorAgentBase):
             source_name="SONBEST XM8504",
         )
 
-    def simulate_values(self) -> SensorSimulationResult:
+    def simulate_values(
+        self,
+        simulated_at: datetime | None = None,
+    ) -> SensorSimulationResult:
         anomaly = self.should_emit_anomaly()
 
         if anomaly:
@@ -354,7 +426,10 @@ class TR4H01XAgent(SensorAgentBase):
             source_name="TR-4H01X RS485 Smart 4 Probe Soil Moisture Sensor",
         )
 
-    def simulate_values(self) -> SensorSimulationResult:
+    def simulate_values(
+        self,
+        simulated_at: datetime | None = None,
+    ) -> SensorSimulationResult:
         anomaly = self.should_emit_anomaly()
         base = self.random.uniform(18.0, 32.0)
         values = {

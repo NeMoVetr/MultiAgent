@@ -213,9 +213,6 @@ def test_algorithm_modules_data_quality_output_feeds_irrigation_decision(tmp_pat
         pressure_hpa=values["air_pressure_hpa"],
         solar_radiation_wm2=values["solar_radiation_wm2"],
         rain_mm=values["rain_interval_mm"],
-        lat=48.708,
-        lng=44.514,
-        elevation=100.0,
     ).get_decision()
 
     assert isinstance(decision, bool)

@@ -223,7 +223,10 @@ class DataQualityAgent(StatusAwareAgent):
         context = dict(raw_context) if isinstance(raw_context, dict) else {}
         context.setdefault("communication_ok", True)
         context.setdefault("sun_state", current_sun_state())
-        context.setdefault("polling_interval_minutes", 10)
+        context.setdefault(
+            "polling_interval_minutes",
+            env_float("SENSOR_SIMULATION_TIME_STEP_MINUTES", 5.0),
+        )
         context.setdefault("probes_same_depth", True)
 
         rain_value = self.latest_clean_values.get("rain_interval_mm")
