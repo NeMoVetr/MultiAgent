@@ -6,6 +6,8 @@ import pandas as pd
 import pyet
 import requests
 
+from .dailycache import DailyCache
+
 logger = logging.getLogger(__name__)
 
 
@@ -49,6 +51,7 @@ class Irrigation:
         self.elevation = self.__get_elevation(self.lat, self.lng)
 
     @staticmethod
+    @DailyCache
     def __get_location() -> tuple[float, float]:
         """Автоматическое определение широты и долготы по IP"""
         try:
@@ -68,6 +71,7 @@ class Irrigation:
             )
 
     @staticmethod
+    @DailyCache
     def __get_elevation(lat: float, lng: float) -> float:
         """Автоматическое определение высоты над уровнем моря (земная поверхность)"""
         try:
