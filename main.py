@@ -26,18 +26,15 @@ from SensorAgent import (
 
 logger = logging.getLogger(__name__)
 
-XMPP_HOST = os.getenv("XMPP_HOST", "localhost")
-XMPP_PORT = int(os.getenv("XMPP_PORT", "5222"))
-AGENT_PASSWORD = os.getenv("SPADE_AGENT_PASSWORD", "agent_password_123")
+XMPP_HOST = os.getenv("XMPP_HOST")
+AGENT_HOST = os.getenv("AGENT_HOST")
+XMPP_PORT = int(os.getenv("XMPP_PORT"))
+AGENT_PASSWORD = os.getenv("SPADE_AGENT_PASSWORD")
 
-DATA_QUALITY_AGENT_JID = os.getenv(
-    "DATA_QUALITY_AGENT_JID",
-    f"data_quality@{XMPP_HOST}",
-)
-IRRIGATOR_AGENT_JID = os.getenv(
-    "IRRIGATOR_AGENT_JID",
-    f"irrigator@{XMPP_HOST}",
-)
+DATA_QUALITY_AGENT_JID = f"data_quality@{AGENT_HOST}"
+
+IRRIGATOR_AGENT_JID = f"irrigator@{AGENT_HOST}"
+
 
 SENSOR_AGENT_DEFINITIONS = [
     ("sm9560b", SM9560BAgent),
@@ -74,7 +71,7 @@ def create_sensor_agents():
     agents = []
 
     for localpart, agent_class in SENSOR_AGENT_DEFINITIONS:
-        jid = f"{localpart}@{XMPP_HOST}"
+        jid = f"{localpart}@{AGENT_HOST}"
         agent = agent_class(
             jid,
             AGENT_PASSWORD,

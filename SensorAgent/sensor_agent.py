@@ -80,6 +80,107 @@ def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+def sensor_scenario_mode() -> str:
+    return os.getenv("SENSOR_SCENARIO_MODE", "realistic_cycle").strip().lower()
+
+
+def realistic_scenario_enabled() -> bool:
+    return sensor_scenario_mode() not in {"random", "legacy", "off", "0", "false"}
+
+
+def smoothstep(edge0: float, edge1: float, value: float) -> float:
+    if edge0 == edge1:
+        return 1.0 if value >= edge1 else 0.0
+
+    x = clamp((value - edge0) / (edge1 - edge0), 0.0, 1.0)
+    return x * x * (3 - 2 * x)
+
+
+def interpolate(start: float, end: float, fraction: float) -> float:
+    return start + (end - start) * clamp(fraction, 0.0, 1.0)
+
+
+def realistic_environment_profile(moment: datetime | None = None) -> dict[str, float | str]:
+    """
+    Shared deterministic profile for all simulated sensors.
+
+    The goal is not to generate unrelated random values, but to model one
+    realistic day with several irrigation decisions:
+    - wet/normal soil: no irrigation;
+    - hot dry soil with low wind and no rain: irrigation;
+    - dry soil with high wind: no irrigation;
+    - rain after a dry period: no irrigation and soil moisture recovery.
+    """
+    hour = utc_hour_fraction(moment)
+    curve = day_curve(moment)
+
+    rain_strength = 0.0
+    if 16.0 <= hour < 17.5:
+        rain_strength = math.sin((hour - 16.0) / 1.5 * math.pi)
+
+    if hour < 6.0:
+        soil = interpolate(25.0, 24.2, hour / 6.0)
+    elif hour < 13.0:
+        soil = interpolate(24.2, 13.2, (hour - 6.0) / 7.0)
+    elif hour < 16.0:
+        soil = interpolate(13.2, 12.6, (hour - 13.0) / 3.0)
+    elif hour < 18.0:
+        soil = interpolate(12.6, 25.5, smoothstep(16.0, 18.0, hour))
+    else:
+        soil = interpolate(25.5, 23.4, (hour - 18.0) / 6.0)
+
+    high_wind = 14.0 <= hour < 15.2
+    rain_active = rain_strength > 0.0
+
+    if high_wind:
+        wind_speed = 6.2 + 0.8 * math.sin((hour - 14.0) / 1.2 * math.pi)
+    else:
+        wind_speed = 1.1 + 1.7 * curve
+
+    cloud_factor = 1.0 - 0.55 * rain_strength
+    if curve <= 0.001:
+        solar_radiation = 0.0
+        illuminance = 0.0
+    else:
+        solar_radiation = max(0.0, (80.0 + 920.0 * curve) * cloud_factor)
+        illuminance = max(0.0, (1000.0 + 59000.0 * curve) * cloud_factor)
+
+    temperature = 16.0 + 14.5 * curve
+    if 11.0 <= hour < 15.5:
+        temperature += 2.5
+    if rain_active:
+        temperature -= 3.0 * rain_strength
+
+    humidity = 78.0 - 44.0 * curve + 34.0 * rain_strength
+    pressure = 1012.0 + 2.5 * math.sin((hour - 4.0) / 24.0 * 2.0 * math.pi)
+    wind_direction = (170.0 + 45.0 * math.sin(hour / 24.0 * 2.0 * math.pi)) % 360.0
+    rain_interval = 0.0 if not rain_active else 0.4 + 2.4 * rain_strength
+
+    if rain_active:
+        phase = "rain_after_dry_no_irrigation"
+    elif high_wind and soil < 16.0:
+        phase = "dry_high_wind_no_irrigation"
+    elif soil < 15.2 and wind_speed <= 5.0:
+        phase = "dry_hot_irrigation"
+    elif soil >= 18.0:
+        phase = "wet_soil_no_irrigation"
+    else:
+        phase = "transition"
+
+    return {
+        "phase": phase,
+        "soil_moisture_percent": clamp(soil, 0.0, 100.0),
+        "air_temperature_c": clamp(temperature, -40.0, 80.0),
+        "air_humidity_percent": clamp(humidity, 0.0, 100.0),
+        "air_pressure_hpa": clamp(pressure, 300.0, 1100.0),
+        "wind_speed_ms": clamp(wind_speed, 0.0, 45.0),
+        "wind_direction_deg": wind_direction,
+        "solar_radiation_wm2": clamp(solar_radiation, 0.0, 2000.0),
+        "illuminance_lux": clamp(illuminance, 0.0, 65535.0),
+        "rain_interval_mm": clamp(rain_interval, 0.0, 10000.0),
+    }
+
+
 @dataclass(frozen=True)
 class SensorSimulationResult:
     values: dict[str, Any]
@@ -99,7 +200,7 @@ class SensorAgentBase(StatusAwareAgent):
         self.source_name = source_name
         self.data_quality_agent_jid = self.get("data_quality_agent_jid") or os.getenv(
             "DATA_QUALITY_AGENT_JID",
-            "data_quality@localhost",
+            "data_quality@ejabberd1",
         )
 
         self.status_lock = asyncio.Lock()
@@ -212,10 +313,12 @@ class SensorAgentBase(StatusAwareAgent):
         result: SensorSimulationResult,
         simulated_at: datetime | None = None,
     ) -> dict[str, Any]:
+        profile = realistic_environment_profile(simulated_at)
         context: dict[str, Any] = {
             "communication_ok": True,
             "sun_state": sun_state(simulated_at),
             "polling_interval_minutes": self.simulation_time_step_minutes,
+            "simulation_scenario": profile["phase"],
         }
 
         if self.sensor_name == "TR_4H01X":
@@ -303,7 +406,10 @@ class SM9560BAgent(SensorAgentBase):
                 anomaly_type="out_of_range_or_missing",
             )
 
-        if state == "night":
+        if realistic_scenario_enabled():
+            profile = realistic_environment_profile(simulated_at)
+            value = float(profile["illuminance_lux"]) + self.random.uniform(-900, 900)
+        elif state == "night":
             value = self.random.uniform(0, 2)
         elif state == "twilight":
             value = self.random.uniform(500, 12000)
@@ -341,11 +447,19 @@ class THPWNJAgent(SensorAgentBase):
                 anomaly_type="weather_out_of_range",
             )
 
-        temperature = 18 + curve * 10 + self.random.uniform(-1.5, 1.5)
-        humidity = 62 - curve * 22 + self.random.uniform(-4, 4)
-        pressure = 1012 + self.random.uniform(-4, 4)
-        wind_speed = max(0.0, self.random.gauss(2.2, 1.0))
-        wind_direction = self.random.uniform(0, 359)
+        if realistic_scenario_enabled():
+            profile = realistic_environment_profile(simulated_at)
+            temperature = float(profile["air_temperature_c"]) + self.random.uniform(-0.4, 0.4)
+            humidity = float(profile["air_humidity_percent"]) + self.random.uniform(-2.0, 2.0)
+            pressure = float(profile["air_pressure_hpa"]) + self.random.uniform(-0.6, 0.6)
+            wind_speed = float(profile["wind_speed_ms"]) + self.random.uniform(-0.25, 0.25)
+            wind_direction = (float(profile["wind_direction_deg"]) + self.random.uniform(-8, 8)) % 360.0
+        else:
+            temperature = 18 + curve * 10 + self.random.uniform(-1.5, 1.5)
+            humidity = 62 - curve * 22 + self.random.uniform(-4, 4)
+            pressure = 1012 + self.random.uniform(-4, 4)
+            wind_speed = max(0.0, self.random.gauss(2.2, 1.0))
+            wind_direction = self.random.uniform(0, 359)
 
         return SensorSimulationResult(
             {
@@ -382,7 +496,10 @@ class TBQ02CAgent(SensorAgentBase):
                 anomaly_type="solar_out_of_range_or_context",
             )
 
-        if state == "night":
+        if realistic_scenario_enabled():
+            profile = realistic_environment_profile(simulated_at)
+            value = float(profile["solar_radiation_wm2"]) + self.random.uniform(-20, 20)
+        elif state == "night":
             value = self.random.uniform(0, 1)
         elif state == "twilight":
             value = self.random.uniform(10, 180)
@@ -413,9 +530,16 @@ class XM8504Agent(SensorAgentBase):
                 anomaly_type="rain_out_of_range_or_spike",
             )
 
-        raining = self.random.random() < env_float("SENSOR_RAIN_PROBABILITY", 0.18)
-        value = self.random.uniform(0.2, 6.0) if raining else 0.0
-        return SensorSimulationResult({"rain_interval_mm": round(value, 1)})
+        if realistic_scenario_enabled():
+            profile = realistic_environment_profile(simulated_at)
+            value = float(profile["rain_interval_mm"])
+            if value > 0.0:
+                value += self.random.uniform(-0.1, 0.1)
+        else:
+            raining = self.random.random() < env_float("SENSOR_RAIN_PROBABILITY", 0.18)
+            value = self.random.uniform(0.2, 6.0) if raining else 0.0
+
+        return SensorSimulationResult({"rain_interval_mm": round(clamp(value, 0, 10000), 1)})
 
 
 class TR4H01XAgent(SensorAgentBase):
@@ -431,10 +555,18 @@ class TR4H01XAgent(SensorAgentBase):
         simulated_at: datetime | None = None,
     ) -> SensorSimulationResult:
         anomaly = self.should_emit_anomaly()
-        base = self.random.uniform(18.0, 32.0)
+
+        if realistic_scenario_enabled():
+            profile = realistic_environment_profile(simulated_at)
+            base = float(profile["soil_moisture_percent"]) + self.random.uniform(-0.2, 0.2)
+            probe_noise = 0.6
+        else:
+            base = self.random.uniform(18.0, 32.0)
+            probe_noise = 1.5
+
         values = {
             f"soil_moisture_probe_{index}_percent": round(
-                clamp(base + self.random.uniform(-1.5, 1.5), 0, 100),
+                clamp(base + self.random.uniform(-probe_noise, probe_noise), 0, 100),
                 1,
             )
             for index in range(1, 5)

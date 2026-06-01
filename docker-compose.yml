@@ -1,4 +1,34 @@
 services:
+  ejabberd:
+    image: ejabberd/ecs
+    container_name: ejabberd1
+    restart: always
+
+    ports:
+      - "5222:5222"
+      - "5280:5280"
+      - "5443:5443"
+
+    environment:
+      - EJABBERD_DOMAIN=localhost
+      - EJABBERD_ADMIN=admin1@localhost
+      - EJABBERD_LOGLEVEL=4
+      - STARTTLS_REQUIRED=false
+      - CTL_ON_CREATE=! register admin1 localhost passw0rd
+      - CTL_ON_START=oauth_issue_token admin1@localhost 33334444 ejabberd:admin
+
+    volumes:
+      - ./ejabberd/conf:/home/ejabberd/conf
+      - ./ejabberd/database:/home/ejabberd/database
+      - ./ejabberd/logs:/home/ejabberd/logs
+
+    healthcheck:
+      test: ["CMD", "ejabberdctl", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
   multiagent:
     build: .
     container_name: multiagent_app
@@ -14,6 +44,10 @@ services:
     working_dir: /app
 
     command: uv run python main.py
+
+    depends_on:
+      ejabberd:
+        condition: service_healthy
 
 volumes:
   uv_cache:

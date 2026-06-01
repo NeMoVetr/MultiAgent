@@ -1,0 +1,9 @@
+ejabberd/database/
+ejabberd/logs/
+ejabberd/upload/
+__pycache__/
+.git/
+*.pyc
+.pytest_cache/
+.venv/
+venv/

@@ -90,10 +90,7 @@ class DataQualityAgent(StatusAwareAgent):
         logger.info("Data quality agent started: %s", self.jid)
 
         self.state_lock = asyncio.Lock()
-        self.irrigator_agent_jid = self.get("irrigator_agent_jid") or os.getenv(
-            "IRRIGATOR_AGENT_JID",
-            "irrigator@localhost",
-        )
+        self.irrigator_agent_jid = self.get("irrigator_agent_jid")
         self.expected_sensor_names = self.parse_expected_sensor_names()
 
         self.latest_raw_by_sensor: dict[str, dict[str, Any]] = {}
