@@ -4,6 +4,7 @@ from .sensor_agent import (
     THPWNJAgent,
     TR4H01XAgent,
     XM8504Agent,
+    OpticalRainGaugeAgent
 )
 
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "THPWNJAgent",
     "TR4H01XAgent",
     "XM8504Agent",
+    "OpticalRainGaugeAgent"
 ]

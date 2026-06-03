@@ -17,6 +17,7 @@ configure_logging()
 from DataQualityAgent import DataQualityAgent
 from IrrigatorAgent import IrrigatorAgent
 from SensorAgent import (
+    OpticalRainGaugeAgent,
     SM9560BAgent,
     TBQ02CAgent,
     THPWNJAgent,
@@ -26,7 +27,6 @@ from SensorAgent import (
 
 logger = logging.getLogger(__name__)
 
-XMPP_HOST = os.getenv("XMPP_HOST")
 AGENT_HOST = os.getenv("AGENT_HOST")
 XMPP_PORT = int(os.getenv("XMPP_PORT"))
 AGENT_PASSWORD = os.getenv("SPADE_AGENT_PASSWORD")
@@ -35,13 +35,13 @@ DATA_QUALITY_AGENT_JID = f"data_quality@{AGENT_HOST}"
 
 IRRIGATOR_AGENT_JID = f"irrigator@{AGENT_HOST}"
 
-
 SENSOR_AGENT_DEFINITIONS = [
     ("sm9560b", SM9560BAgent),
     ("thpwnj", THPWNJAgent),
     ("tbq02c", TBQ02CAgent),
     ("xm8504", XM8504Agent),
     ("tr4h01x", TR4H01XAgent),
+    ("optical_rain", OpticalRainGaugeAgent),
 ]
 
 

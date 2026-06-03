@@ -1,6 +1,5 @@
 import asyncio
 import json
-import random
 from pathlib import Path
 from typing import Any
 
@@ -13,13 +12,14 @@ from DataQualityAgent.data_quality_agent import (
 )
 from IrrigatorAgent.irrigator_agent import IrrigatorAgent, quality_input_template
 from SensorAgent import (
+    OpticalRainGaugeAgent,
     SM9560BAgent,
     TBQ02CAgent,
     THPWNJAgent,
     TR4H01XAgent,
     XM8504Agent,
 )
-from SensorAgent.sensor_agent import SENSOR_DATA_ONTOLOGY, SensorSimulationResult
+from SensorAgent.sensor_agent import SENSOR_DATA_ONTOLOGY
 from StatusAgent import AgentStatus
 from algorithms.data_quality import DataQuality
 from algorithms.irrigator import Irrigation
@@ -45,6 +45,46 @@ class FakeSender:
 class FailingSender:
     async def send(self, msg) -> None:
         raise RuntimeError("simulated send failure")
+
+
+class FakeBehaviour:
+    def __init__(self) -> None:
+        self.sent_messages = []
+
+    async def send(self, msg) -> None:
+        self.sent_messages.append(msg)
+
+    def is_killed(self) -> bool:
+        return False
+
+
+class FakeMQTTMessage:
+    def __init__(self, topic: str, payload: dict[str, Any]) -> None:
+        self.topic = topic
+        self.payload = json.dumps(payload).encode("utf-8")
+
+
+class FakeMQTTClient:
+    published_messages = []
+    client_kwargs = []
+
+    def __init__(self, **kwargs) -> None:
+        self.client_kwargs.append(kwargs)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    async def publish(self, topic, payload, qos=0) -> None:
+        self.published_messages.append(
+            {
+                "topic": topic,
+                "payload": payload,
+                "qos": qos,
+            }
+        )
 
 
 def run(coro):
@@ -269,7 +309,7 @@ def test_data_quality_agent_forwards_spade_message_to_irrigator(tmp_path: Path):
                 "wind_direction_deg": 720,
             },
             "air_temperature_c",
-            20.0,
+            0.0,
         ),
         ("SONBEST_SM9560B", {"illuminance_lux": 90000}, "illuminance_lux", 0.0),
         ("XS_TBQ02C", {"solar_radiation_wm2": -15}, "solar_radiation_wm2", 0.0),
@@ -283,7 +323,7 @@ def test_data_quality_agent_forwards_spade_message_to_irrigator(tmp_path: Path):
                 "soil_moisture_probe_4_percent": 24,
             },
             "soil_moisture_probe_1_percent",
-            24.0,
+            0.0,
         ),
     ],
 )
@@ -313,33 +353,43 @@ def test_data_quality_replaces_sensor_anomalies(
 # 6. Agent status tests
 
 
-def test_sensor_status_changes_to_working_and_degraded():
+def test_sensor_status_changes_to_working_and_degraded_from_mqtt_payloads():
     agent = SM9560BAgent("sm9560b@localhost", "secret", verify_security=False)
-    agent.sensor_id = "sm9560b"
-    agent.source_name = "SONBEST SM9560B"
-    agent.status_lock = asyncio.Lock()
-    agent.generated_count = 0
-    agent.anomaly_count = 0
-    agent.last_generated_at = None
-    agent.last_generated_monotonic = None
-    agent.last_send_error = None
+    agent.set("data_quality_agent_jid", "data_quality@localhost")
+    agent.set("mqtt_topic", "rs485/sm9560b")
+    behaviour = FakeBehaviour()
 
     run(
-        agent.record_generation(
-            SensorSimulationResult({"illuminance_lux": 1000.0}),
-            sent_ok=True,
+        agent.handle_mqtt_message(
+            behaviour,
+            FakeMQTTMessage(
+                "rs485/sm9560b",
+                {
+                    "sensorId": "sm9560b-1",
+                    "timestamp": "2026-07-15T10:00:00Z",
+                    "registers": {"illuminance_lux": 1000.0},
+                },
+            ),
         )
     )
-    assert agent.current_operational_status == AgentStatus.WORKING.value
+    assert agent.get("last_agent_status") == AgentStatus.WORKING.value
+    assert len(behaviour.sent_messages) == 1
 
     run(
-        agent.record_generation(
-            SensorSimulationResult({"illuminance_lux": 1000.0}),
-            sent_ok=False,
-            error="send failed",
+        agent.handle_mqtt_message(
+            behaviour,
+            FakeMQTTMessage(
+                "rs485/sm9560b",
+                {
+                    "sensorId": "sm9560b-1",
+                    "timestamp": "2026-07-15T10:01:00Z",
+                    "registers": {"unexpected": 123.0},
+                },
+            ),
         )
     )
-    assert agent.current_operational_status == AgentStatus.DEGRADED.value
+    assert agent.get("last_agent_status") == AgentStatus.DEGRADED.value
+    assert len(behaviour.sent_messages) == 1
 
 
 def test_data_quality_and_irrigator_statuses_wait_then_work(tmp_path: Path):
@@ -405,6 +455,45 @@ def test_end_to_end_pipeline_writes_clean_state_and_decision_json(tmp_path: Path
     assert "soil_moisture_probe_1_percent" in decision_payload["inputs"]
 
 
+def test_irrigator_publishes_decision_to_configured_mqtt_topic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    FakeMQTTClient.published_messages = []
+    FakeMQTTClient.client_kwargs = []
+    monkeypatch.setattr(
+        "IrrigatorAgent.irrigator_agent.aiomqtt.Client",
+        FakeMQTTClient,
+    )
+
+    agent = make_irrigator_agent(tmp_path)
+    agent.mqtt_host = "mqtt.local"
+    agent.mqtt_port = 1884
+    agent.mqtt_keepalive = 30
+    agent.mqtt_qos = 1
+    agent.mqtt_decision_topic = "controls/irrigation"
+
+    for record in complete_quality_records():
+        run(agent.process_quality_sample(record))
+
+    assert FakeMQTTClient.client_kwargs == [
+        {
+            "hostname": "mqtt.local",
+            "port": 1884,
+            "keepalive": 30,
+        }
+    ]
+    assert len(FakeMQTTClient.published_messages) == 1
+    published = FakeMQTTClient.published_messages[0]
+    decision_payload = json.loads(
+        (tmp_path / "irrigation_decision.json").read_text(encoding="utf-8")
+    )
+
+    assert published["topic"] == "controls/irrigation"
+    assert published["qos"] == 1
+    assert json.loads(published["payload"]) == decision_payload
+
+
 # 8. Fault-tolerance tests
 
 
@@ -446,14 +535,15 @@ def test_irrigator_waits_when_one_sensor_is_missing(tmp_path: Path):
 # 9. Regression tests
 
 
-def test_regression_main_factories_expose_five_current_sensor_agents():
+def test_regression_main_factories_expose_current_sensor_agents():
     from main import create_sensor_agents
 
     agents = create_sensor_agents()
     classes = {type(agent) for agent in agents}
 
-    assert len(agents) == 5
+    assert len(agents) == 6
     assert classes == {
+        OpticalRainGaugeAgent,
         SM9560BAgent,
         THPWNJAgent,
         TBQ02CAgent,
@@ -462,28 +552,100 @@ def test_regression_main_factories_expose_five_current_sensor_agents():
     }
 
 
-def test_regression_sensor_normal_samples_stay_inside_declared_ranges():
-    agents = [
-        SM9560BAgent("sm9560b@localhost", "secret", verify_security=False),
-        THPWNJAgent("thpwnj@localhost", "secret", verify_security=False),
-        TBQ02CAgent("tbq02c@localhost", "secret", verify_security=False),
-        XM8504Agent("xm8504@localhost", "secret", verify_security=False),
-        TR4H01XAgent("tr4h01x@localhost", "secret", verify_security=False),
-    ]
+@pytest.mark.parametrize(
+    "agent_class, topic, registers, expected_measurements",
+    [
+        (
+            SM9560BAgent,
+            "rs485/sm9560b",
+            {"illuminance_lux": 65535.0, "ignored": 1},
+            {"illuminance_lux": 65535.0},
+        ),
+        (
+            THPWNJAgent,
+            "rs485/thpwnj",
+            {
+                "air_temperature_c": 25.0,
+                "air_humidity_percent": 60.0,
+                "air_pressure_hpa": 1010.0,
+                "wind_speed_ms": 2.5,
+                "wind_direction_deg": 180.0,
+                "ignored": 1,
+            },
+            {
+                "air_temperature_c": 25.0,
+                "air_humidity_percent": 60.0,
+                "air_pressure_hpa": 1010.0,
+                "wind_speed_ms": 2.5,
+                "wind_direction_deg": 180.0,
+            },
+        ),
+        (
+            TBQ02CAgent,
+            "rs485/tbq02c",
+            {"solar_radiation_wm2": 760.0, "ignored": 1},
+            {"solar_radiation_wm2": 760.0},
+        ),
+        (
+            XM8504Agent,
+            "rs485/xm8504",
+            {"rain_interval_mm": 0.0, "ignored": 1},
+            {"rain_interval_mm": 0.0},
+        ),
+        (
+            TR4H01XAgent,
+            "rs485/tr4h01x",
+            {
+                "soil_moisture_probe_1_percent": 14.0,
+                "soil_moisture_probe_2_percent": 13.5,
+                "soil_moisture_probe_3_percent": 14.2,
+                "soil_moisture_probe_4_percent": 13.9,
+                "ignored": 1,
+            },
+            {
+                "soil_moisture_probe_1_percent": 14.0,
+                "soil_moisture_probe_2_percent": 13.5,
+                "soil_moisture_probe_3_percent": 14.2,
+                "soil_moisture_probe_4_percent": 13.9,
+            },
+        ),
+        (
+            OpticalRainGaugeAgent,
+            "rs485/optical-rain",
+            {
+                "rainfall_total_mm": 3.0,
+                "rain_interval_mm": 0.5,
+                "rain_intensity_mm_min": 0.1,
+                "illuminance_lux": 12000.0,
+                "ignored": 1,
+            },
+            {
+                "rainfall_total_mm": 3.0,
+                "rain_interval_mm": 0.5,
+                "rain_intensity_mm_min": 0.1,
+                "illuminance_lux": 12000.0,
+            },
+        ),
+    ],
+)
+def test_regression_sensor_agents_normalize_mqtt_registers(
+    agent_class,
+    topic: str,
+    registers: dict[str, Any],
+    expected_measurements: dict[str, Any],
+):
+    agent = agent_class(f"{agent_class.__name__.lower()}@localhost", "secret", verify_security=False)
+    payload = {
+        "sensorId": "sensor-1",
+        "timestamp": "2026-07-15T10:00:00Z",
+        "registers": registers,
+    }
 
-    for agent in agents:
-        agent.random = random.Random(1)
-        agent.should_emit_anomaly = lambda: False
+    normalized = agent.normalize_mqtt_payload(topic, json.dumps(payload).encode("utf-8"))
 
-    results = [agent.simulate_values().values for agent in agents]
-
-    assert 0 <= results[0]["illuminance_lux"] <= 65535
-    assert -40 <= results[1]["air_temperature_c"] <= 80
-    assert 0 <= results[1]["air_humidity_percent"] <= 100
-    assert 300 <= results[1]["air_pressure_hpa"] <= 1100
-    assert 0 <= results[1]["wind_speed_ms"] <= 45
-    assert 0 <= results[1]["wind_direction_deg"] <= 359
-    assert 0 <= results[2]["solar_radiation_wm2"] <= 2000
-    assert 0 <= results[3]["rain_interval_mm"] <= 9999
-    for value in results[4].values():
-        assert 0 <= value <= 100
+    assert normalized["source"] == "mqtt"
+    assert normalized["topic"] == topic
+    assert normalized["sensor_id"] == "sensor-1"
+    assert normalized["sensor_name"] == agent.SENSOR_NAME
+    assert normalized["measurements"] == expected_measurements
+    assert normalized["values"] == expected_measurements

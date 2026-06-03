@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 import csv
 
+import aiomqtt
 from dotenv import load_dotenv
 from spade.behaviour import CyclicBehaviour, PeriodicBehaviour
 from spade.template import Template
@@ -117,6 +118,16 @@ class IrrigatorAgent(StatusAwareAgent):
         )
         self.csv_output_file.parent.mkdir(parents=True, exist_ok=True)
 
+        self.mqtt_host = os.getenv("MQTT_HOST", "host.docker.internal")
+        self.mqtt_port = int(os.getenv("MQTT_PORT", "1883"))
+        self.mqtt_username = os.getenv("MQTT_USERNAME") or None
+        self.mqtt_password = os.getenv("MQTT_PASSWORD") or None
+        self.mqtt_keepalive = int(os.getenv("MQTT_KEEPALIVE_SECONDS", "60"))
+        self.mqtt_qos = int(os.getenv("MQTT_QOS", "0"))
+        self.mqtt_decision_topic = os.getenv(
+            "MQTT_TOPIC_IRRIGATION_DECISION",
+            "irrigation/decision",
+        )
 
         self.set_agent_status(
             AgentStatus.ONLINE_IDLE,
@@ -182,6 +193,22 @@ class IrrigatorAgent(StatusAwareAgent):
         payload = self.build_decision_payload(decision)
         self.write_decision(payload)
         self.append_decision_csv(payload)
+
+        try:
+            await self.publish_decision_mqtt(payload)
+        except aiomqtt.MqttError as error:
+            self.last_error = str(error)
+            self.set_agent_status(
+                AgentStatus.DEGRADED,
+                "irrigator MQTT publish failed",
+                priority=self.priority,
+            )
+            logger.warning(
+                "Irrigator failed to publish decision to MQTT topic %s: %s",
+                getattr(self, "mqtt_decision_topic", None),
+                error,
+            )
+            return
 
         self.set_agent_status(
             AgentStatus.WORKING,
@@ -291,6 +318,41 @@ class IrrigatorAgent(StatusAwareAgent):
             os.fsync(file.fileno())
 
         os.replace(tmp_file, self.output_file)
+
+    async def publish_decision_mqtt(self, payload: dict[str, Any]) -> None:
+        topic = getattr(self, "mqtt_decision_topic", None)
+        if not topic:
+            return
+
+        client_kwargs: dict[str, Any] = {
+            "hostname": getattr(
+                self,
+                "mqtt_host",
+                os.getenv("MQTT_HOST", "host.docker.internal"),
+            ),
+            "port": getattr(self, "mqtt_port", int(os.getenv("MQTT_PORT", "1883"))),
+            "keepalive": getattr(
+                self,
+                "mqtt_keepalive",
+                int(os.getenv("MQTT_KEEPALIVE_SECONDS", "60")),
+            ),
+        }
+
+        username = getattr(self, "mqtt_username", os.getenv("MQTT_USERNAME") or None)
+        password = getattr(self, "mqtt_password", os.getenv("MQTT_PASSWORD") or None)
+
+        if username:
+            client_kwargs["username"] = username
+        if password:
+            client_kwargs["password"] = password
+
+        encoded_payload = json.dumps(payload, ensure_ascii=False)
+        qos = getattr(self, "mqtt_qos", int(os.getenv("MQTT_QOS", "0")))
+
+        async with aiomqtt.Client(**client_kwargs) as client:
+            await client.publish(topic, encoded_payload, qos=qos)
+
+        logger.info("Published irrigation decision to MQTT topic %s", topic)
 
     def append_decision_csv(self, payload: dict[str, Any]) -> None:
         inputs = dict(payload.get("inputs") or {})

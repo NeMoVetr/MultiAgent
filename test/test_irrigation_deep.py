@@ -127,6 +127,7 @@ def test_get_location_success_and_failure(monkeypatch):
     monkeypatch.setattr(irrigator.geocoder, "ip", lambda _: type("Geo", (), {"ok": True, "lat": 48.7, "lng": 44.5})())
     assert Irrigation._Irrigation__get_location() == (48.7, 44.5)
 
+    Irrigation._Irrigation__get_location._cache.clear()
     monkeypatch.setattr(irrigator.geocoder, "ip", lambda _: type("Geo", (), {"ok": False, "lat": None, "lng": None})())
     with pytest.raises(RuntimeError, match="coordinates"):
         Irrigation._Irrigation__get_location()
@@ -157,6 +158,7 @@ def test_get_elevation_success_and_failure(monkeypatch):
         def json(self):
             return {}
 
+    Irrigation._Irrigation__get_elevation._cache.clear()
     monkeypatch.setattr(irrigator.requests, "get", lambda url, timeout: BadResponse())
     with pytest.raises(RuntimeError, match="height"):
         Irrigation._Irrigation__get_elevation(48.7, 44.5)

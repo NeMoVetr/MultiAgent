@@ -1,586 +1,329 @@
 import asyncio
 import json
 import logging
-import math
 import os
-import random
 import time
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
-from dotenv import load_dotenv
-from spade.behaviour import PeriodicBehaviour
+import aiomqtt
+from spade.behaviour import OneShotBehaviour
 from spade.message import Message
 
-from StatusAgent import AgentStatus, StatusAwareAgent, utc_now_iso
-
-load_dotenv()
+from StatusAgent import AgentStatus, StatusAwareAgent
 
 logger = logging.getLogger(__name__)
 
 SENSOR_DATA_ONTOLOGY = "sensor-data"
 
-
-def env_float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)))
-    except ValueError:
-        logger.warning("Invalid value for %s. Using default: %s", name, default)
-        return default
-
-
-def utc_iso(moment: datetime) -> str:
-    return (
-        moment.astimezone(timezone.utc)
-        .isoformat(timespec="milliseconds")
-        .replace("+00:00", "Z")
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
+        "+00:00",
+        "Z",
     )
 
 
-def parse_utc_datetime(value: str) -> datetime:
-    parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+class MQTTSensorAgent(StatusAwareAgent):
+    """Base class for concrete MQTT -> XMPP sensor agents."""
 
+    SENSOR_NAME = "MQTT_SENSOR"
+    MQTT_TOPIC_ENV = "MQTT_TOPIC_SENSOR"
+    DEFAULT_MQTT_TOPIC = "rs485/sensor"
+    MEASUREMENT_KEYS: tuple[str, ...] = ()
 
-def floor_datetime_to_step(moment: datetime, step_seconds: int) -> datetime:
-    moment = moment.astimezone(timezone.utc)
-    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-    seconds = int((moment - epoch).total_seconds())
-    floored_seconds = seconds - seconds % step_seconds
-    return epoch + timedelta(seconds=floored_seconds)
+    class MQTTSubscribeBehaviour(OneShotBehaviour):
+        async def run(self) -> None:
+            await self.agent.listen_mqtt_forever(self)
 
-
-def utc_hour_fraction(moment: datetime | None = None) -> float:
-    now = moment.astimezone(timezone.utc) if moment else datetime.now(timezone.utc)
-    return now.hour + now.minute / 60.0 + now.second / 3600.0
-
-
-def sun_state(moment: datetime | None = None) -> str:
-    hour = utc_hour_fraction(moment)
-
-    if 6.0 <= hour < 8.0 or 18.0 <= hour < 20.0:
-        return "twilight"
-
-    if 8.0 <= hour < 18.0:
-        return "day"
-
-    return "night"
-
-
-def day_curve(moment: datetime | None = None) -> float:
-    hour = utc_hour_fraction(moment)
-    value = math.sin((hour - 6.0) / 12.0 * math.pi)
-    return max(0.0, value)
-
-
-def clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
-
-
-def sensor_scenario_mode() -> str:
-    return os.getenv("SENSOR_SCENARIO_MODE", "realistic_cycle").strip().lower()
-
-
-def realistic_scenario_enabled() -> bool:
-    return sensor_scenario_mode() not in {"random", "legacy", "off", "0", "false"}
-
-
-def smoothstep(edge0: float, edge1: float, value: float) -> float:
-    if edge0 == edge1:
-        return 1.0 if value >= edge1 else 0.0
-
-    x = clamp((value - edge0) / (edge1 - edge0), 0.0, 1.0)
-    return x * x * (3 - 2 * x)
-
-
-def interpolate(start: float, end: float, fraction: float) -> float:
-    return start + (end - start) * clamp(fraction, 0.0, 1.0)
-
-
-def realistic_environment_profile(moment: datetime | None = None) -> dict[str, float | str]:
-    """
-    Shared deterministic profile for all simulated sensors.
-
-    The goal is not to generate unrelated random values, but to model one
-    realistic day with several irrigation decisions:
-    - wet/normal soil: no irrigation;
-    - hot dry soil with low wind and no rain: irrigation;
-    - dry soil with high wind: no irrigation;
-    - rain after a dry period: no irrigation and soil moisture recovery.
-    """
-    hour = utc_hour_fraction(moment)
-    curve = day_curve(moment)
-
-    rain_strength = 0.0
-    if 16.0 <= hour < 17.5:
-        rain_strength = math.sin((hour - 16.0) / 1.5 * math.pi)
-
-    if hour < 6.0:
-        soil = interpolate(25.0, 24.2, hour / 6.0)
-    elif hour < 13.0:
-        soil = interpolate(24.2, 13.2, (hour - 6.0) / 7.0)
-    elif hour < 16.0:
-        soil = interpolate(13.2, 12.6, (hour - 13.0) / 3.0)
-    elif hour < 18.0:
-        soil = interpolate(12.6, 25.5, smoothstep(16.0, 18.0, hour))
-    else:
-        soil = interpolate(25.5, 23.4, (hour - 18.0) / 6.0)
-
-    high_wind = 14.0 <= hour < 15.2
-    rain_active = rain_strength > 0.0
-
-    if high_wind:
-        wind_speed = 6.2 + 0.8 * math.sin((hour - 14.0) / 1.2 * math.pi)
-    else:
-        wind_speed = 1.1 + 1.7 * curve
-
-    cloud_factor = 1.0 - 0.55 * rain_strength
-    if curve <= 0.001:
-        solar_radiation = 0.0
-        illuminance = 0.0
-    else:
-        solar_radiation = max(0.0, (80.0 + 920.0 * curve) * cloud_factor)
-        illuminance = max(0.0, (1000.0 + 59000.0 * curve) * cloud_factor)
-
-    temperature = 16.0 + 14.5 * curve
-    if 11.0 <= hour < 15.5:
-        temperature += 2.5
-    if rain_active:
-        temperature -= 3.0 * rain_strength
-
-    humidity = 78.0 - 44.0 * curve + 34.0 * rain_strength
-    pressure = 1012.0 + 2.5 * math.sin((hour - 4.0) / 24.0 * 2.0 * math.pi)
-    wind_direction = (170.0 + 45.0 * math.sin(hour / 24.0 * 2.0 * math.pi)) % 360.0
-    rain_interval = 0.0 if not rain_active else 0.4 + 2.4 * rain_strength
-
-    if rain_active:
-        phase = "rain_after_dry_no_irrigation"
-    elif high_wind and soil < 16.0:
-        phase = "dry_high_wind_no_irrigation"
-    elif soil < 15.2 and wind_speed <= 5.0:
-        phase = "dry_hot_irrigation"
-    elif soil >= 18.0:
-        phase = "wet_soil_no_irrigation"
-    else:
-        phase = "transition"
-
-    return {
-        "phase": phase,
-        "soil_moisture_percent": clamp(soil, 0.0, 100.0),
-        "air_temperature_c": clamp(temperature, -40.0, 80.0),
-        "air_humidity_percent": clamp(humidity, 0.0, 100.0),
-        "air_pressure_hpa": clamp(pressure, 300.0, 1100.0),
-        "wind_speed_ms": clamp(wind_speed, 0.0, 45.0),
-        "wind_direction_deg": wind_direction,
-        "solar_radiation_wm2": clamp(solar_radiation, 0.0, 2000.0),
-        "illuminance_lux": clamp(illuminance, 0.0, 65535.0),
-        "rain_interval_mm": clamp(rain_interval, 0.0, 10000.0),
-    }
-
-
-@dataclass(frozen=True)
-class SensorSimulationResult:
-    values: dict[str, Any]
-    anomaly: bool = False
-    anomaly_type: str | None = None
-
-
-class SensorAgentBase(StatusAwareAgent):
-    async def setup_sensor_agent(
-        self,
-        sensor_id: str,
-        sensor_name: str,
-        source_name: str,
-    ) -> None:
-        self.sensor_id = sensor_id
-        self.sensor_name = sensor_name
-        self.source_name = source_name
-        self.data_quality_agent_jid = self.get("data_quality_agent_jid") or os.getenv(
-            "DATA_QUALITY_AGENT_JID",
-            "data_quality@ejabberd1",
+    async def setup(self) -> None:
+        self.set("mqtt_host", os.getenv("MQTT_HOST", "host.docker.internal"))
+        self.set("mqtt_port", int(os.getenv("MQTT_PORT", "1883")))
+        self.set("mqtt_username", os.getenv("MQTT_USERNAME") or None)
+        self.set("mqtt_password", os.getenv("MQTT_PASSWORD") or None)
+        self.set("mqtt_keepalive", int(os.getenv("MQTT_KEEPALIVE_SECONDS", "60")))
+        self.set("mqtt_qos", int(os.getenv("MQTT_QOS", "0")))
+        self.set("mqtt_reconnect_seconds", float(os.getenv("MQTT_RECONNECT_SECONDS", "5")))
+        self.set(
+            "mqtt_no_data_warning_seconds",
+            float(os.getenv("MQTT_NO_DATA_WARNING_SECONDS", "30")),
         )
+        self.set("mqtt_topic", os.getenv(self.MQTT_TOPIC_ENV, self.DEFAULT_MQTT_TOPIC))
+        self.set("mqtt_connected", False)
+        self.set("last_mqtt_message_monotonic", None)
 
-        self.status_lock = asyncio.Lock()
-        self.last_generated_at: str | None = None
-        self.last_generated_monotonic: float | None = None
-        self.last_send_error: str | None = None
-        self.generated_count = 0
-        self.anomaly_count = 0
-        self.random = random.Random(f"{sensor_id}-{os.getpid()}-{time.time_ns()}")
-
-        self.current_operational_status = AgentStatus.ONLINE_IDLE.value
-        self.current_status_message = f"{self.source_name} simulator starting"
-
-        self.set_agent_status(
+        self.set_offline_message("MQTT sensor agent stopped")
+        self.set_sensor_status(
             AgentStatus.ONLINE_IDLE,
-            self.current_status_message,
-            priority=5,
+            f"starting MQTT listener for topic {self.get('mqtt_topic')}",
+            priority=4,
         )
-        self.set_offline_message("stopped normally")
-
-        self.simulation_time_step_minutes = env_float(
-            "SENSOR_SIMULATION_TIME_STEP_MINUTES",
-            5.0,
-        )
-        self.simulation_time_step_seconds = max(
-            1,
-            int(self.simulation_time_step_minutes * 60),
-        )
-        self.simulation_time_step = timedelta(
-            seconds=self.simulation_time_step_seconds,
-        )
-
-        start_raw = os.getenv("SENSOR_SIMULATION_START_ISO")
-        if start_raw:
-            self.next_simulated_at = parse_utc_datetime(start_raw)
-        else:
-            self.next_simulated_at = floor_datetime_to_step(
-                datetime.now(timezone.utc),
-                self.simulation_time_step_seconds,
-            )
-
-        period = env_float("SENSOR_SIMULATION_PERIOD_SECONDS", 5.0)
-        self.add_behaviour(SensorSimulationBehaviour(period=period))
 
         logger.info(
-            "Sensor simulator configured: sensor_id=%s, source=%s, data_quality=%s, "
-            "real_period=%ss, simulated_step=%smin, simulated_start=%s",
-            self.sensor_id,
-            self.source_name,
-            self.data_quality_agent_jid,
-            period,
-            self.simulation_time_step_minutes,
-            utc_iso(self.next_simulated_at),
+            "%s configured for MQTT topic %s at %s:%s",
+            self.SENSOR_NAME,
+            self.get("mqtt_topic"),
+            self.get("mqtt_host"),
+            self.get("mqtt_port"),
         )
 
-    def should_emit_anomaly(self) -> bool:
-        probability = env_float("SENSOR_ANOMALY_PROBABILITY", 0.12)
-        return self.random.random() < probability
+        self.add_behaviour(self.MQTTSubscribeBehaviour())
 
-    async def record_generation(
-        self,
-        result: SensorSimulationResult,
-        sent_ok: bool,
-        error: str | None = None,
+    def set_sensor_status(
+            self,
+            status: AgentStatus,
+            message: str,
+            priority: int = 5,
     ) -> None:
-        async with self.status_lock:
-            self.generated_count += 1
-            if result.anomaly:
-                self.anomaly_count += 1
+        try:
+            self.set_agent_status(status, message, priority=priority)
+        except Exception as exc:
+            logger.debug("%s presence update failed: %s", self.SENSOR_NAME, exc)
 
-            self.last_generated_at = utc_now_iso()
-            self.last_generated_monotonic = time.monotonic()
-            self.last_send_error = error
+    async def listen_mqtt_forever(self, behaviour: OneShotBehaviour) -> None:
+        while not behaviour.is_killed():
+            try:
+                await self.listen_mqtt_once(behaviour)
+            except asyncio.CancelledError:
+                raise
+            except aiomqtt.MqttError as exc:
+                self.set("mqtt_connected", False)
+                self.set_sensor_status(
+                    AgentStatus.DEGRADED,
+                    f"MQTT broker unavailable at {self.get('mqtt_host')}:{self.get('mqtt_port')}; reconnecting",
+                    priority=3,
+                )
+                logger.warning(
+                    "%s MQTT broker unavailable at %s:%s; reconnect in %.1f seconds: %s",
+                    self.SENSOR_NAME,
+                    self.get("mqtt_host"),
+                    self.get("mqtt_port"),
+                    float(self.get("mqtt_reconnect_seconds")),
+                    exc,
+                )
+                await asyncio.sleep(float(self.get("mqtt_reconnect_seconds")))
+            except Exception as exc:
+                self.set("mqtt_connected", False)
+                self.set_sensor_status(
+                    AgentStatus.DEGRADED,
+                    "MQTT listener failed; reconnecting",
+                    priority=3,
+                )
+                logger.warning(
+                    "%s MQTT listener failed; reconnect in %.1f seconds: %s",
+                    self.SENSOR_NAME,
+                    float(self.get("mqtt_reconnect_seconds")),
+                    exc,
+                )
+                await asyncio.sleep(float(self.get("mqtt_reconnect_seconds")))
 
-            if sent_ok:
-                status = AgentStatus.WORKING
-                if result.anomaly:
-                    message = (
-                        f"{self.source_name} generated anomalous sample "
-                        f"({self.anomaly_count}/{self.generated_count})"
-                    )
-                else:
-                    message = f"{self.source_name} simulating sensor data"
+    async def listen_mqtt_once(self, behaviour: OneShotBehaviour) -> None:
+        client_kwargs: dict[str, Any] = {
+            "hostname": self.get("mqtt_host"),
+            "port": self.get("mqtt_port"),
+            "keepalive": self.get("mqtt_keepalive"),
+        }
+
+        if self.get("mqtt_username"):
+            client_kwargs["username"] = self.get("mqtt_username")
+        if self.get("mqtt_password"):
+            client_kwargs["password"] = self.get("mqtt_password")
+
+        topic = self.get("mqtt_topic")
+        qos = self.get("mqtt_qos")
+
+        async with aiomqtt.Client(**client_kwargs) as client:
+            await client.subscribe(topic, qos=qos)
+            self.set("mqtt_connected", True)
+            self.set("last_mqtt_message_monotonic", None)
+            self.set_sensor_status(
+                AgentStatus.ONLINE_IDLE,
+                f"MQTT connected and subscribed to {topic}; waiting for data",
+                priority=4,
+            )
+            logger.info("%s connected to MQTT and subscribed to %s", self.SENSOR_NAME, topic)
+
+            no_data_task = asyncio.create_task(self.warn_if_no_data(behaviour, topic))
+
+            try:
+                messages = client.messages
+                if callable(messages):
+                    messages = messages()
+
+                async for message in messages:
+                    if behaviour.is_killed():
+                        break
+                    await self.handle_mqtt_message(behaviour, message)
+            finally:
+                no_data_task.cancel()
+                await asyncio.gather(no_data_task, return_exceptions=True)
+                self.set("mqtt_connected", False)
+
+    async def warn_if_no_data(self, behaviour: OneShotBehaviour, topic: str) -> None:
+        threshold_seconds = self.get("mqtt_no_data_warning_seconds")
+
+        while not behaviour.is_killed():
+            await asyncio.sleep(threshold_seconds)
+
+            if not self.get("mqtt_connected"):
+                continue
+
+            last_message_at = self.get("last_mqtt_message_monotonic")
+            if last_message_at is None:
+                message = f"MQTT subscribed to {topic}, but no data has been received yet"
             else:
-                status = AgentStatus.DEGRADED
-                message = f"{self.source_name} failed to send data"
+                elapsed_seconds = time.monotonic() - last_message_at
+                if elapsed_seconds < threshold_seconds:
+                    continue
+                message = (
+                    f"MQTT subscribed to {topic}, but no data has been received "
+                    f"for {elapsed_seconds:.0f} seconds"
+                )
 
-            self.current_operational_status = status.value
-            self.current_status_message = message
-            self.set_offline_message(f"stopped normally; previous status {status.value}")
+            self.set_sensor_status(AgentStatus.ONLINE_IDLE, message, priority=4)
+            logger.warning("%s %s", self.SENSOR_NAME, message)
 
-        self.set_agent_status(status, message, priority=5)
-
-        if status == AgentStatus.DEGRADED:
-            logger.warning(
-                "Sensor %s status changed to %s: %s; error=%s",
-                self.sensor_id,
-                status.value,
-                message,
-                error,
-            )
-
-    def take_simulated_timestamp(self) -> datetime:
-        simulated_at = self.next_simulated_at
-        self.next_simulated_at = simulated_at + self.simulation_time_step
-        return simulated_at
-
-    def build_context(
-        self,
-        result: SensorSimulationResult,
-        simulated_at: datetime | None = None,
-    ) -> dict[str, Any]:
-        profile = realistic_environment_profile(simulated_at)
-        context: dict[str, Any] = {
-            "communication_ok": True,
-            "sun_state": sun_state(simulated_at),
-            "polling_interval_minutes": self.simulation_time_step_minutes,
-            "simulation_scenario": profile["phase"],
-        }
-
-        if self.sensor_name == "TR_4H01X":
-            context["probes_same_depth"] = True
-            context["rain_or_irrigation"] = False
-
-        if self.sensor_name == "SONBEST_XM8504":
-            context["rain_or_irrigation"] = (
-                float(result.values.get("rain_interval_mm") or 0.0) > 0.0
-            )
-
-        return context
-
-    def simulate_values(
-        self,
-        simulated_at: datetime | None = None,
-    ) -> SensorSimulationResult:
-        raise NotImplementedError
-
-
-class SensorSimulationBehaviour(PeriodicBehaviour):
-    async def on_start(self) -> None:
-        logger.info("Sensor simulation started: %s", self.agent.sensor_id)
-
-    async def run(self) -> None:
-        simulated_at = self.agent.take_simulated_timestamp()
-        result = self.agent.simulate_values(simulated_at)
-        timestamp = utc_iso(simulated_at)
-        body = {
-            "kind": "sensor_sample",
-            "sensor_id": self.agent.sensor_id,
-            "sensor_name": self.agent.sensor_name,
-            "source_name": self.agent.source_name,
-            "timestamp": timestamp,
-            "values": result.values,
-            "context": self.agent.build_context(result, simulated_at),
-            "is_anomaly": result.anomaly,
-            "anomaly_type": result.anomaly_type,
-            "sent_at": utc_now_iso(),
-        }
-
-        msg = Message(to=self.agent.data_quality_agent_jid)
-        msg.set_metadata("performative", "inform")
-        msg.set_metadata("ontology", SENSOR_DATA_ONTOLOGY)
-        msg.set_metadata("kind", "sensor_sample")
-        msg.body = json.dumps(body, ensure_ascii=False)
+    async def handle_mqtt_message(self,behaviour: OneShotBehaviour,  message: Any) -> None:
+        topic = str(getattr(getattr(message, "topic", self.get("mqtt_topic")), "value", self.get("mqtt_topic")))
 
         try:
-            await self.send(msg)
-        except Exception as error:
-            await self.agent.record_generation(result, sent_ok=False, error=str(error))
-            logger.exception("Sensor %s failed to send sample", self.agent.sensor_id)
+            normalized = self.normalize_mqtt_payload(topic, message.payload)
+        except Exception as exc:
+            self.set_sensor_status(
+                AgentStatus.DEGRADED,
+                f"invalid MQTT payload from {topic}",
+                priority=3,
+            )
+            logger.warning("%s invalid MQTT payload from %s: %s", self.SENSOR_NAME, topic, exc)
             return
 
-        await self.agent.record_generation(result, sent_ok=True)
-        logger.debug("Sensor %s generated sample: %s", self.agent.sensor_id, body)
-
-
-class SM9560BAgent(SensorAgentBase):
-    async def setup(self) -> None:
-        await self.setup_sensor_agent(
-            sensor_id="sm9560b",
-            sensor_name="SONBEST_SM9560B",
-            source_name="SONBEST SM9560B",
-        )
-
-    def simulate_values(
-        self,
-        simulated_at: datetime | None = None,
-    ) -> SensorSimulationResult:
-        anomaly = self.should_emit_anomaly()
-        state = sun_state(simulated_at)
-        curve = day_curve(simulated_at)
-
-        if anomaly:
-            if state == "night":
-                return SensorSimulationResult(
-                    {"illuminance_lux": self.random.uniform(8000, 20000)},
-                    anomaly=True,
-                    anomaly_type="night_illuminance",
-                )
-            return SensorSimulationResult(
-                {"illuminance_lux": self.random.choice([-50, 90000, None])},
-                anomaly=True,
-                anomaly_type="out_of_range_or_missing",
+        measurements = normalized["measurements"]
+        if not measurements:
+            self.set_sensor_status(
+                AgentStatus.DEGRADED,
+                f"MQTT payload from {topic} has no expected measurements",
+                priority=3,
             )
-
-        if realistic_scenario_enabled():
-            profile = realistic_environment_profile(simulated_at)
-            value = float(profile["illuminance_lux"]) + self.random.uniform(-900, 900)
-        elif state == "night":
-            value = self.random.uniform(0, 2)
-        elif state == "twilight":
-            value = self.random.uniform(500, 12000)
-        else:
-            value = 15000 + curve * 45000 + self.random.uniform(-1500, 1500)
-
-        return SensorSimulationResult({"illuminance_lux": round(clamp(value, 0, 65535), 1)})
-
-
-class THPWNJAgent(SensorAgentBase):
-    async def setup(self) -> None:
-        await self.setup_sensor_agent(
-            sensor_id="thpwnj",
-            sensor_name="Veinasa_THPW_NJ",
-            source_name="Veinasa THPW-NJ",
-        )
-
-    def simulate_values(
-        self,
-        simulated_at: datetime | None = None,
-    ) -> SensorSimulationResult:
-        anomaly = self.should_emit_anomaly()
-        curve = day_curve(simulated_at)
-
-        if anomaly:
-            return SensorSimulationResult(
-                {
-                    "air_temperature_c": self.random.choice([-80, 130]),
-                    "air_humidity_percent": self.random.choice([-15, 140]),
-                    "air_pressure_hpa": self.random.choice([200, 1300]),
-                    "wind_speed_ms": self.random.choice([-3, 80]),
-                    "wind_direction_deg": self.random.choice([-40, 720, None]),
-                },
-                anomaly=True,
-                anomaly_type="weather_out_of_range",
+            logger.warning(
+                "%s MQTT payload from %s has no expected measurements",
+                self.SENSOR_NAME,
+                topic,
             )
+            return
 
-        if realistic_scenario_enabled():
-            profile = realistic_environment_profile(simulated_at)
-            temperature = float(profile["air_temperature_c"]) + self.random.uniform(-0.4, 0.4)
-            humidity = float(profile["air_humidity_percent"]) + self.random.uniform(-2.0, 2.0)
-            pressure = float(profile["air_pressure_hpa"]) + self.random.uniform(-0.6, 0.6)
-            wind_speed = float(profile["wind_speed_ms"]) + self.random.uniform(-0.25, 0.25)
-            wind_direction = (float(profile["wind_direction_deg"]) + self.random.uniform(-8, 8)) % 360.0
-        else:
-            temperature = 18 + curve * 10 + self.random.uniform(-1.5, 1.5)
-            humidity = 62 - curve * 22 + self.random.uniform(-4, 4)
-            pressure = 1012 + self.random.uniform(-4, 4)
-            wind_speed = max(0.0, self.random.gauss(2.2, 1.0))
-            wind_direction = self.random.uniform(0, 359)
-
-        return SensorSimulationResult(
-            {
-                "air_temperature_c": round(clamp(temperature, -40, 80), 1),
-                "air_humidity_percent": round(clamp(humidity, 0, 100), 1),
-                "air_pressure_hpa": round(clamp(pressure, 300, 1100), 1),
-                "wind_speed_ms": round(clamp(wind_speed, 0, 45), 1),
-                "wind_direction_deg": round(clamp(wind_direction, 0, 359), 0),
-            }
+        await self.send_to_data_quality_agent(behaviour, normalized)
+        self.set("last_mqtt_message_monotonic", time.monotonic())
+        self.set_sensor_status(
+            AgentStatus.WORKING,
+            f"received MQTT data from {topic}: {', '.join(measurements)}",
+            priority=6,
         )
 
+    def normalize_mqtt_payload(self, topic: str, raw_payload: bytes) -> dict[str, Any]:
+        payload = json.loads(raw_payload.decode("utf-8"))
+        registers = payload["registers"]
 
-class TBQ02CAgent(SensorAgentBase):
-    async def setup(self) -> None:
-        await self.setup_sensor_agent(
-            sensor_id="tbq02c",
-            sensor_name="XS_TBQ02C",
-            source_name="XS-TBQ02C Total Radiation Sensor",
-        )
+        if not isinstance(registers, dict):
+            raise ValueError("payload.registers must be an object")
 
-    def simulate_values(
-        self,
-        simulated_at: datetime | None = None,
-    ) -> SensorSimulationResult:
-        anomaly = self.should_emit_anomaly()
-        state = sun_state(simulated_at)
-        curve = day_curve(simulated_at)
-
-        if anomaly:
-            value = self.random.choice([-25, 2600, 600 if state == "night" else None])
-            return SensorSimulationResult(
-                {"solar_radiation_wm2": value},
-                anomaly=True,
-                anomaly_type="solar_out_of_range_or_context",
-            )
-
-        if realistic_scenario_enabled():
-            profile = realistic_environment_profile(simulated_at)
-            value = float(profile["solar_radiation_wm2"]) + self.random.uniform(-20, 20)
-        elif state == "night":
-            value = self.random.uniform(0, 1)
-        elif state == "twilight":
-            value = self.random.uniform(10, 180)
-        else:
-            value = 180 + curve * 850 + self.random.uniform(-30, 30)
-
-        return SensorSimulationResult({"solar_radiation_wm2": round(clamp(value, 0, 2000), 1)})
-
-
-class XM8504Agent(SensorAgentBase):
-    async def setup(self) -> None:
-        await self.setup_sensor_agent(
-            sensor_id="xm8504",
-            sensor_name="SONBEST_XM8504",
-            source_name="SONBEST XM8504",
-        )
-
-    def simulate_values(
-        self,
-        simulated_at: datetime | None = None,
-    ) -> SensorSimulationResult:
-        anomaly = self.should_emit_anomaly()
-
-        if anomaly:
-            return SensorSimulationResult(
-                {"rain_interval_mm": self.random.choice([-1.0, 12000.0, 120.0])},
-                anomaly=True,
-                anomaly_type="rain_out_of_range_or_spike",
-            )
-
-        if realistic_scenario_enabled():
-            profile = realistic_environment_profile(simulated_at)
-            value = float(profile["rain_interval_mm"])
-            if value > 0.0:
-                value += self.random.uniform(-0.1, 0.1)
-        else:
-            raining = self.random.random() < env_float("SENSOR_RAIN_PROBABILITY", 0.18)
-            value = self.random.uniform(0.2, 6.0) if raining else 0.0
-
-        return SensorSimulationResult({"rain_interval_mm": round(clamp(value, 0, 10000), 1)})
-
-
-class TR4H01XAgent(SensorAgentBase):
-    async def setup(self) -> None:
-        await self.setup_sensor_agent(
-            sensor_id="tr4h01x",
-            sensor_name="TR_4H01X",
-            source_name="TR-4H01X RS485 Smart 4 Probe Soil Moisture Sensor",
-        )
-
-    def simulate_values(
-        self,
-        simulated_at: datetime | None = None,
-    ) -> SensorSimulationResult:
-        anomaly = self.should_emit_anomaly()
-
-        if realistic_scenario_enabled():
-            profile = realistic_environment_profile(simulated_at)
-            base = float(profile["soil_moisture_percent"]) + self.random.uniform(-0.2, 0.2)
-            probe_noise = 0.6
-        else:
-            base = self.random.uniform(18.0, 32.0)
-            probe_noise = 1.5
-
-        values = {
-            f"soil_moisture_probe_{index}_percent": round(
-                clamp(base + self.random.uniform(-probe_noise, probe_noise), 0, 100),
-                1,
-            )
-            for index in range(1, 5)
+        measurements = {
+            key: registers[key]
+            for key in self.MEASUREMENT_KEYS
+            if key in registers
         }
 
-        if anomaly:
-            probe = self.random.randint(1, 4)
-            values[f"soil_moisture_probe_{probe}_percent"] = self.random.choice(
-                [-10.0, 140.0, 85.0, None]
-            )
-            return SensorSimulationResult(
-                values,
-                anomaly=True,
-                anomaly_type="soil_probe_outlier",
-            )
+        sensor_id = payload.get("sensorId")
+        timestamp = payload.get("timestamp") or now_utc_iso()
 
-        return SensorSimulationResult(values)
+        return {
+            "type": "sensor_data",
+            "source": "mqtt",
+            "topic": topic,
+            "sensor_id": sensor_id,
+            "sensorId": sensor_id,
+            "sensor_name": self.SENSOR_NAME,
+            "sensorName": self.SENSOR_NAME,
+            "timestamp": timestamp,
+            "registers": registers,
+            "measurements": measurements,
+            "readings": measurements,
+            "values": measurements,
+            "data": measurements,
+            "raw": payload,
+        }
+
+    async def send_to_data_quality_agent(self,  behaviour: OneShotBehaviour, normalized: dict[str, Any]) -> None:
+        receiver = self.get("data_quality_agent_jid")
+        if not receiver:
+            raise RuntimeError("data_quality_agent_jid is not set")
+
+        msg = Message(to=receiver)
+        msg.set_metadata("performative", "inform")
+        msg.set_metadata("ontology", "sensor-data")
+        msg.set_metadata("content-type", "application/json")
+        msg.body = json.dumps(normalized, ensure_ascii=False)
+
+        await behaviour.send(msg)
+        logger.info(
+            "Forwarded MQTT payload from topic=%s sensor=%s fields=%s",
+            normalized["topic"],
+            normalized["sensor_name"],
+            list(normalized["measurements"].keys()),
+        )
+
+
+class SM9560BAgent(MQTTSensorAgent):
+    SENSOR_NAME = "SONBEST_SM9560B"
+    MQTT_TOPIC_ENV = "MQTT_TOPIC_ILLUMINANCE_SM9560B"
+    DEFAULT_MQTT_TOPIC = "rs485/sm9560b"
+    MEASUREMENT_KEYS = ("illuminance_lux",)
+
+
+class THPWNJAgent(MQTTSensorAgent):
+    SENSOR_NAME = "Veinasa_THPW_NJ"
+    MQTT_TOPIC_ENV = "MQTT_TOPIC_WEATHER_THPWNJ"
+    DEFAULT_MQTT_TOPIC = "rs485/thpwnj"
+    MEASUREMENT_KEYS = (
+        "wind_speed_ms",
+        "wind_direction_deg",
+        "air_temperature_c",
+        "air_humidity_percent",
+        "air_pressure_hpa",
+    )
+
+
+class TBQ02CAgent(MQTTSensorAgent):
+    SENSOR_NAME = "XS_TBQ02C"
+    MQTT_TOPIC_ENV = "MQTT_TOPIC_SOLAR_RADIATION_TBQ02C"
+    DEFAULT_MQTT_TOPIC = "rs485/tbq02c"
+    MEASUREMENT_KEYS = ("solar_radiation_wm2",)
+
+
+class XM8504Agent(MQTTSensorAgent):
+    SENSOR_NAME = "SONBEST_XM8504"
+    MQTT_TOPIC_ENV = "MQTT_TOPIC_RAIN_GAUGE_XM8504"
+    DEFAULT_MQTT_TOPIC = "rs485/xm8504"
+    MEASUREMENT_KEYS = ("rain_interval_mm",)
+
+
+class TR4H01XAgent(MQTTSensorAgent):
+    SENSOR_NAME = "TR_4H01X"
+    MQTT_TOPIC_ENV = "MQTT_TOPIC_SOIL_MOISTURE_TR4H01X"
+    DEFAULT_MQTT_TOPIC = "rs485/tr4h01x"
+    MEASUREMENT_KEYS = (
+        "soil_moisture_probe_1_percent",
+        "soil_moisture_probe_2_percent",
+        "soil_moisture_probe_3_percent",
+        "soil_moisture_probe_4_percent",
+    )
+
+
+class OpticalRainGaugeAgent(MQTTSensorAgent):
+    SENSOR_NAME = "OPTICAL_RAIN_GAUGE"
+    MQTT_TOPIC_ENV = "MQTT_TOPIC_OPTICAL_RAIN_GAUGE"
+    DEFAULT_MQTT_TOPIC = "rs485/optical-rain"
+    MEASUREMENT_KEYS = (
+        "rainfall_total_mm",
+        "rain_interval_mm",
+        "rain_intensity_mm_min",
+        "illuminance_lux",
+    )

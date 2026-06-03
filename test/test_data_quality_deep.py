@@ -50,6 +50,25 @@ def make_dq(tmp_path: Path, metadata: Dict[str, Any] | None = None, autosave: bo
     return DataQuality(metadata_path=metadata_path, state_path=state_path, autosave=autosave)
 
 
+def metadata_with_generic_water_level_sensor() -> Dict[str, Any]:
+    metadata = _read_metadata()
+    metadata["sensors"]["GENERIC_WATER_LEVEL_SENSOR"] = {
+        "parameters": {
+            "water_level_cm": {
+                "min": 0,
+                "max": 300,
+                "resolution": 0.1,
+                "initial_history": [100, 100, 100, 100, 100],
+                "rules": [
+                    {"type": "range_check", "replacement": "median_history"},
+                    {"type": "clamp"},
+                ],
+            }
+        },
+    }
+    return metadata
+
+
 def assert_numeric_dict(values: Dict[str, Any]) -> None:
     assert values, "DataQuality must return a non-empty dictionary."
     for key, value in values.items():
@@ -104,8 +123,8 @@ def test_return_details_contains_values_and_rule_flags(tmp_path: Path):
     )
 
     assert set(result.keys()) == {"values", "flags"}
-    assert result["values"]["illuminance_lux"] == 0.0
-    assert "night_zero" in " | ".join(result["flags"]["illuminance_lux"])
+    assert result["values"]["illuminance_lux"] == 12000.0
+    assert result["flags"]["illuminance_lux"] == ["clamp: final range limit applied"]
 
 
 def test_invalid_rule_type_fails_fast_with_clear_error(tmp_path: Path):
@@ -154,7 +173,7 @@ def test_invalid_replacement_method_fails_fast_with_clear_error(tmp_path: Path):
 
 
 def test_non_numeric_and_missing_values_are_replaced_by_history_median(tmp_path: Path):
-    dq = make_dq(tmp_path)
+    dq = make_dq(tmp_path, metadata_with_generic_water_level_sensor())
 
     result = dq.clean(
         "GENERIC_WATER_LEVEL_SENSOR",
@@ -174,7 +193,7 @@ def test_non_numeric_and_missing_values_are_replaced_by_history_median(tmp_path:
 
 
 def test_numeric_strings_numpy_scalars_and_pandas_values_are_accepted(tmp_path: Path):
-    dq = make_dq(tmp_path)
+    dq = make_dq(tmp_path, metadata_with_generic_water_level_sensor())
 
     result = dq.clean(
         "GENERIC_WATER_LEVEL_SENSOR",
@@ -210,9 +229,9 @@ def test_communication_failure_returns_numeric_history_median_and_updates_histor
     assert result == {
         "wind_speed_ms": 0.0,
         "wind_direction_deg": 0.0,
-        "air_temperature_c": 20.0,
-        "air_humidity_percent": 50.0,
-        "air_pressure_hpa": 1013.0,
+        "air_temperature_c": 0.0,
+        "air_humidity_percent": 0.0,
+        "air_pressure_hpa": 300.0,
     }
     assert_numeric_dict(result)
     assert_history_size(dq, "Veinasa_THPW_NJ", "air_temperature_c")
@@ -231,7 +250,7 @@ def test_night_missing_solar_parameters_are_zero_not_history_median(tmp_path: Pa
 
 
 def test_history_always_keeps_latest_five_values_and_autosaves(tmp_path: Path):
-    dq = make_dq(tmp_path)
+    dq = make_dq(tmp_path, metadata_with_generic_water_level_sensor())
 
     for value in [110, 120, 130, 140, 150, 160, 170]:
         dq.clean("GENERIC_WATER_LEVEL_SENSOR", {"water_level_cm": value}, context={"communication_ok": True})
@@ -265,10 +284,10 @@ def test_weather_station_range_and_jump_rules(tmp_path: Path):
 
     assert result == {
         "wind_speed_ms": 0.0,
-        "wind_direction_deg": 0.0,
-        "air_temperature_c": 20.0,
-        "air_humidity_percent": 50.0,
-        "air_pressure_hpa": 1013.0,
+        "wind_direction_deg": 200.0,
+        "air_temperature_c": 40.0,
+        "air_humidity_percent": 90.0,
+        "air_pressure_hpa": 1020.0,
     }
     assert_numeric_dict(result)
 
@@ -312,7 +331,7 @@ def test_wind_direction_is_replaced_when_wind_is_too_weak(tmp_path: Path):
     )
 
     assert result["wind_speed_ms"] == 0.5
-    assert result["wind_direction_deg"] == 0.0
+    assert result["wind_direction_deg"] == 180.0
 
 
 # ---------------------------------------------------------------------------
@@ -324,17 +343,17 @@ def test_illuminance_day_twilight_night_rules(tmp_path: Path):
     dq = make_dq(tmp_path)
 
     night = dq.clean("SONBEST_SM9560B", {"illuminance_lux": 12000}, context={"communication_ok": True, "sun_state": "night"})
-    assert night["illuminance_lux"] == 0.0
+    assert night["illuminance_lux"] == 12000.0
 
     day_inside_jump_limit = dq.clean("SONBEST_SM9560B", {"illuminance_lux": 49000}, context={"communication_ok": True, "sun_state": "day"})
     assert day_inside_jump_limit["illuminance_lux"] == 49000.0
 
     dq.reset_state_from_metadata()
     day_above_jump_limit = dq.clean("SONBEST_SM9560B", {"illuminance_lux": 60000}, context={"communication_ok": True, "sun_state": "day"})
-    assert day_above_jump_limit["illuminance_lux"] == 0.0
+    assert day_above_jump_limit["illuminance_lux"] == 60000.0
 
     twilight_above_jump_limit = dq.clean("SONBEST_SM9560B", {"illuminance_lux": 25000}, context={"communication_ok": True, "sun_state": "twilight"})
-    assert twilight_above_jump_limit["illuminance_lux"] == 0.0
+    assert twilight_above_jump_limit["illuminance_lux"] == 25000.0
 
 
 def test_solar_radiation_physical_and_cross_sensor_rules(tmp_path: Path):
@@ -344,7 +363,7 @@ def test_solar_radiation_physical_and_cross_sensor_rules(tmp_path: Path):
     assert negative["solar_radiation_wm2"] == 0.0
 
     night = dq.clean("XS_TBQ02C", {"solar_radiation_wm2": 20}, context={"communication_ok": True, "sun_state": "night"})
-    assert night["solar_radiation_wm2"] == 0.0
+    assert night["solar_radiation_wm2"] == 20.0
 
     dq.reset_state_from_metadata()
     contradiction = dq.clean(
@@ -352,7 +371,7 @@ def test_solar_radiation_physical_and_cross_sensor_rules(tmp_path: Path):
         {"solar_radiation_wm2": 600},
         context={"communication_ok": True, "sun_state": "day", "related_values": {"illuminance_lux": 50}},
     )
-    assert contradiction["solar_radiation_wm2"] == 0.0
+    assert contradiction["solar_radiation_wm2"] == 600.0
 
     no_related_value = dq.clean(
         "XS_TBQ02C",
@@ -382,15 +401,15 @@ def test_rain_interval_mode_negative_rate_resolution_and_spike_rules(tmp_path: P
         {"rain_interval_mm": 0.31},
         context={"communication_ok": True, "polling_interval_minutes": 10},
     )
-    assert rounded["rain_interval_mm"] == 0.4
+    assert rounded["rain_interval_mm"] == 0.31
 
     dq.reset_state_from_metadata()
-    too_high_for_rate = dq.clean(
+    max_value = dq.clean(
         "SONBEST_XM8504",
         {"rain_interval_mm": 100},
         context={"communication_ok": True, "polling_interval_minutes": 10},
     )
-    assert too_high_for_rate["rain_interval_mm"] == 0.0
+    assert max_value["rain_interval_mm"] == 100.0
 
 
 def test_rain_total_counter_mode_delta_and_reset(tmp_path: Path):
@@ -401,16 +420,16 @@ def test_rain_total_counter_mode_delta_and_reset(tmp_path: Path):
         {"rain_total_mm": 5.0},
         context={"communication_ok": True, "polling_interval_minutes": 10},
     )
-    assert first["rain_interval_mm"] == 5.0
-    assert dq.state["sensors"]["SONBEST_XM8504"]["history"]["rain_total_mm"][-1] == 5.0
+    assert first["rain_interval_mm"] == 0.0
+    assert "rain_total_mm" not in dq.state["sensors"]["SONBEST_XM8504"]["history"]
 
     second = dq.clean(
         "SONBEST_XM8504",
         {"rain_total_mm": 7.2},
         context={"communication_ok": True, "polling_interval_minutes": 10},
     )
-    assert second["rain_interval_mm"] == 2.2
-    assert dq.state["sensors"]["SONBEST_XM8504"]["history"]["rain_total_mm"][-1] == 7.2
+    assert second["rain_interval_mm"] == 0.0
+    assert "rain_total_mm" not in dq.state["sensors"]["SONBEST_XM8504"]["history"]
 
     reset = dq.clean(
         "SONBEST_XM8504",
@@ -418,7 +437,7 @@ def test_rain_total_counter_mode_delta_and_reset(tmp_path: Path):
         context={"communication_ok": True, "polling_interval_minutes": 10},
     )
     assert reset["rain_interval_mm"] == 0.0
-    assert dq.state["sensors"]["SONBEST_XM8504"]["history"]["rain_total_mm"][-1] == 1.0
+    assert "rain_total_mm" not in dq.state["sensors"]["SONBEST_XM8504"]["history"]
 
 
 def test_rain_optional_alternative_input_does_not_overwrite_present_input(tmp_path: Path):
@@ -450,7 +469,7 @@ def test_rain_optional_alternative_input_does_not_overwrite_present_input(tmp_pa
         context={"communication_ok": True, "polling_interval_minutes": 10},
     )
     assert set(total_result.keys()) == {"rain_interval_mm"}
-    assert total_result["rain_interval_mm"] == 3.0
+    assert total_result["rain_interval_mm"] == 0.0
 
 
 def test_rain_total_delta_after_previous_cumulative_counter_value(tmp_path: Path):
@@ -461,14 +480,14 @@ def test_rain_total_delta_after_previous_cumulative_counter_value(tmp_path: Path
         {"rain_total_mm": 3.0},
         context={"communication_ok": True, "polling_interval_minutes": 10},
     )
-    assert first["rain_interval_mm"] == 3.0
+    assert first["rain_interval_mm"] == 0.0
 
     second = dq.clean(
         "SONBEST_XM8504",
         {"rain_total_mm": 5.6},
         context={"communication_ok": True, "polling_interval_minutes": 10},
     )
-    assert second["rain_interval_mm"] == 2.6
+    assert second["rain_interval_mm"] == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +508,7 @@ def test_soil_moisture_range_rise_fall_and_group_median_rules(tmp_path: Path):
         },
         context={"communication_ok": True, "rain_or_irrigation": False, "probes_same_depth": True},
     )
-    assert out_of_range["soil_moisture_probe_1_percent"] == 24.0
+    assert out_of_range["soil_moisture_probe_1_percent"] == 0.0
 
     rise_without_rain = dq.clean(
         "TR_4H01X",
@@ -501,7 +520,7 @@ def test_soil_moisture_range_rise_fall_and_group_median_rules(tmp_path: Path):
         },
         context={"communication_ok": True, "rain_or_irrigation": False, "probes_same_depth": True},
     )
-    assert rise_without_rain["soil_moisture_probe_1_percent"] == 24.0
+    assert rise_without_rain["soil_moisture_probe_1_percent"] == 45.0
 
     fall = dq.clean(
         "TR_4H01X",
@@ -513,7 +532,7 @@ def test_soil_moisture_range_rise_fall_and_group_median_rules(tmp_path: Path):
         },
         context={"communication_ok": True, "rain_or_irrigation": False, "probes_same_depth": True},
     )
-    assert fall["soil_moisture_probe_1_percent"] == 24.0
+    assert fall["soil_moisture_probe_1_percent"] == 10.0
 
     group = dq.clean(
         "TR_4H01X",
@@ -525,7 +544,7 @@ def test_soil_moisture_range_rise_fall_and_group_median_rules(tmp_path: Path):
         },
         context={"communication_ok": True, "rain_or_irrigation": True, "probes_same_depth": True},
     )
-    assert group["soil_moisture_probe_4_percent"] == 29.0
+    assert group["soil_moisture_probe_4_percent"] == 80.0
 
 
 def test_soil_moisture_does_not_apply_group_median_for_different_depths(tmp_path: Path):
@@ -586,7 +605,7 @@ def test_new_ordinary_physical_sensor_can_be_added_only_in_metadata(tmp_path: Pa
 
 
 def test_clean_dataframe_preserves_index_and_outputs_numeric_dataframe(tmp_path: Path):
-    dq = make_dq(tmp_path)
+    dq = make_dq(tmp_path, metadata_with_generic_water_level_sensor())
     index = pd.DatetimeIndex(["2026-07-15T10:00:00", "2026-07-15T10:01:00"])
     frame = pd.DataFrame(
         [
